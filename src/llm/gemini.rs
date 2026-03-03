@@ -24,6 +24,12 @@ pub struct GeminiImageConfig {
     pub image_size: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GeminiCallResult {
+    pub text: String,
+    pub model_used: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GeminiResponse {
     candidates: Option<Vec<GeminiCandidate>>,
@@ -885,7 +891,7 @@ pub async fn call_gemini(
     media_files: Option<Vec<MediaFile>>,
     youtube_urls: Option<Vec<String>>,
     system_prompt_label: Option<&str>,
-) -> Result<String> {
+) -> Result<GeminiCallResult> {
     let mut content = user_content.to_string();
     if let Some(lang) = response_language {
         content.push_str(&format!("\n\nPlease reply in {}.", lang));
@@ -944,22 +950,70 @@ pub async fn call_gemini(
         "tools": tools,
     });
 
-    let model = if use_pro_model {
+    let primary_model = if use_pro_model {
         &CONFIG.gemini_pro_model
     } else {
         &CONFIG.gemini_model
     };
-    let operation = if use_pro_model {
+    let primary_operation = if use_pro_model {
         "call_gemini_pro"
     } else {
         "call_gemini"
     };
 
-    log_llm_timing("gemini", model, operation, None, || async {
-        let response = call_gemini_api(model, payload, system_prompt_label).await?;
-        Ok(extract_text_from_response(response))
-    })
-    .await
+    let primary_attempt =
+        log_llm_timing("gemini", primary_model, primary_operation, None, || async {
+            let response =
+                call_gemini_api(primary_model, payload.clone(), system_prompt_label).await?;
+            Ok(extract_text_from_response(response))
+        })
+        .await;
+
+    match primary_attempt {
+        Ok(text) => Ok(GeminiCallResult {
+            text,
+            model_used: primary_model.to_string(),
+        }),
+        Err(primary_err) => {
+            if !use_pro_model {
+                return Err(primary_err);
+            }
+
+            let fallback_model = CONFIG.gemini_model.as_str();
+            warn!(
+                "Gemini Pro model '{}' failed after retries; falling back to default model '{}': {}",
+                primary_model, fallback_model, primary_err
+            );
+
+            let fallback_text = log_llm_timing(
+                "gemini",
+                fallback_model,
+                "call_gemini_fallback",
+                None,
+                || async {
+                    let response =
+                        call_gemini_api(fallback_model, payload, system_prompt_label).await?;
+                    Ok(extract_text_from_response(response))
+                },
+            )
+            .await
+            .map_err(|fallback_err| {
+                anyhow!(
+                    "Gemini request failed on primary model '{}' and fallback model '{}'. \
+Primary error: {}. Fallback error: {}",
+                    primary_model,
+                    fallback_model,
+                    primary_err,
+                    fallback_err
+                )
+            })?;
+
+            Ok(GeminiCallResult {
+                text: fallback_text,
+                model_used: fallback_model.to_string(),
+            })
+        }
+    }
 }
 
 pub async fn generate_image_with_gemini(

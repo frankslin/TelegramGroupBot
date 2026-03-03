@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef, MessageId,
-    ParseMode, ReplyParameters,
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef,
+    MessageId, ParseMode, ReplyParameters,
 };
 use teloxide::RequestError;
 
@@ -458,6 +458,7 @@ async fn process_request(
             Some("Q_SYSTEM_PROMPT"),
         )
         .await
+        .map(|result| (result.text, Some(result.model_used)))
     } else {
         let image_data_list: Vec<Vec<u8>> = request
             .media_files
@@ -474,8 +475,9 @@ async fn process_request(
             supports_tools,
         )
         .await
+        .map(|result| (result, None))
     };
-    let response = match response {
+    let (response, gemini_model_used) = match response {
         Ok(response) => response,
         Err(err) => {
             let message = format_llm_error_message(model_name, &err);
@@ -498,11 +500,9 @@ async fn process_request(
     let mut response_text = response;
     if !model_name.is_empty() {
         let display_model = if model_name == MODEL_GEMINI {
-            if !request.media_files.is_empty() || !request.youtube_urls.is_empty() {
-                CONFIG.gemini_pro_model.as_str()
-            } else {
-                CONFIG.gemini_model.as_str()
-            }
+            gemini_model_used
+                .as_deref()
+                .unwrap_or(CONFIG.gemini_model.as_str())
         } else {
             model_name
         };
@@ -752,7 +752,7 @@ pub async fn q_handler(
         )
         .await;
         let response = match response {
-            Ok(response) => response,
+            Ok(response) => response.text,
             Err(err) => {
                 let message = format_llm_error_message(MODEL_GEMINI, &err);
                 bot.edit_message_text(processing_message.chat.id, processing_message.id, message)

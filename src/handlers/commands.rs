@@ -1131,7 +1131,7 @@ pub async fn tldr_handler(
     }
 
     let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
-    let response = call_gemini(
+    let response = match call_gemini(
         &system_prompt,
         &chat_content,
         None,
@@ -1144,9 +1144,27 @@ pub async fn tldr_handler(
         None,
         Some("TLDR_SYSTEM_PROMPT"),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!("TLDR summary generation failed: {}", err);
+            bot.edit_message_text(
+                processing_message.chat.id,
+                processing_message.id,
+                "Failed to generate a summary. Please try again later.",
+            )
+            .await?;
+            complete_command_timer(
+                &mut timer,
+                "error",
+                Some("summary_generation_failed".to_string()),
+            );
+            return Ok(());
+        }
+    };
 
-    if response.trim().is_empty() {
+    if response.text.trim().is_empty() {
         bot.edit_message_text(
             processing_message.chat.id,
             processing_message.id,
@@ -1157,8 +1175,9 @@ pub async fn tldr_handler(
         return Ok(());
     }
 
-    let summary_text = response;
-    let summary_with_model = format!("{}\n\n_Model: {}_", summary_text, CONFIG.gemini_pro_model);
+    let summary_text = response.text;
+    let summary_model = response.model_used;
+    let summary_with_model = format!("{}\n\nModel: {}", summary_text, summary_model);
 
     let _ = bot
         .edit_message_text(
@@ -1213,15 +1232,18 @@ Use the same language as the summary text for any labels.\
     let mut telegraph_url = None;
     if let Some(url) = &infographic_url {
         let telegraph_content = format!(
-            "![Infographic]({})\n\n{}\n\n_Model: {}_",
-            url, summary_text, CONFIG.gemini_pro_model
+            "![Infographic]({})\n\n{}\n\nModel: {}",
+            url, summary_text, summary_model
         );
         telegraph_url =
             create_telegraph_page("Message Summary with Infographic", &telegraph_content).await;
     }
 
     let final_message = if let Some(url) = telegraph_url {
-        format!("Chat summary with infographic: [View it here]({})", url)
+        format!(
+            "Chat summary with infographic: [View it here]({})\n\nModel: {}",
+            url, summary_model
+        )
     } else if let Some(url) = infographic_url {
         format!("{}\n\nInfographic: {}", summary_with_model, url)
     } else {
@@ -1476,7 +1498,7 @@ pub async fn factcheck_handler(
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let system_prompt = FACTCHECK_SYSTEM_PROMPT.replace("{current_datetime}", &now);
-    let response = call_gemini(
+    let response = match call_gemini(
         &system_prompt,
         &statement,
         None,
@@ -1489,13 +1511,28 @@ pub async fn factcheck_handler(
         None,
         Some("FACTCHECK_SYSTEM_PROMPT"),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            error!("Fact-check generation failed: {}", err);
+            bot.edit_message_text(
+                processing_message.chat.id,
+                processing_message.id,
+                "Failed to fact-check this message. Please try again later.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let response_with_model = format!("{}\n\nModel: {}", response.text, response.model_used);
 
     send_response(
         &bot,
         processing_message.chat.id,
         processing_message.id,
-        &response,
+        &response_with_model,
         "Fact Check",
         ParseMode::Markdown,
     )
@@ -1596,7 +1633,7 @@ pub async fn profileme_handler(
         &bot,
         processing_message.chat.id,
         processing_message.id,
-        &response,
+        &response.text,
         "Your User Profile",
         ParseMode::Markdown,
     )
@@ -1687,7 +1724,8 @@ pub async fn paintme_handler(
             "PAINTME_SYSTEM_PROMPT"
         }),
     )
-    .await?;
+    .await?
+    .text;
     drop(typing_chat_action);
 
     let status_text = if portrait {
