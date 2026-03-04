@@ -1038,7 +1038,7 @@ pub async fn generate_image_with_gemini(
     let system_instruction = base_instruction.to_string();
     let parts = build_gemini_parts(prompt, &images, None, None, &[], false);
     let mut generation_config = json!({
-        "responseModalities": ["TEXT", "IMAGE"]
+        "responseModalities": ["IMAGE"]
     });
     if let Some(image_config) = build_image_config(image_config.as_ref()) {
         if let Some(config_object) = generation_config.as_object_mut() {
@@ -1051,7 +1051,7 @@ pub async fn generate_image_with_gemini(
         "contents": [{ "role": "user", "parts": parts }],
         "generationConfig": generation_config,
         "safetySettings": build_safety_settings(),
-        "tools": [{ "google_search": {} }],
+        "tools": [{ "google_search": {"searchTypes": {"webSearch": {}, "imageSearch": {}}} }],
     });
 
     let model = &CONFIG.gemini_image_model;

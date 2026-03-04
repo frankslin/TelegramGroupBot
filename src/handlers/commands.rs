@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+﻿use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -36,8 +36,8 @@ use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::{error, warn};
 
 const IMAGE_RESOLUTION_OPTIONS: [&str; 3] = ["2K", "4K", "1K"];
-const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 10] = [
-    "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5",
+const IMAGE_ASPECT_RATIO_OPTIONS: [&str; 14] = [
+    "4:3", "3:4", "16:9", "9:16", "1:1", "21:9", "3:2", "2:3", "5:4", "4:5", "4:1", "1:4", "8:1", "1:8",
 ];
 const IMAGE_RESOLUTION_CALLBACK_PREFIX: &str = "image_res:";
 const IMAGE_ASPECT_RATIO_CALLBACK_PREFIX: &str = "image_aspect:";
@@ -1198,7 +1198,7 @@ Use the same language as the summary text for any labels.\
     let mut infographic_url = None;
     let infographic_config = Some(GeminiImageConfig {
         aspect_ratio: Some("16:9".to_string()),
-        image_size: Some("2K".to_string()),
+        image_size: Some("4K".to_string()),
     });
     match generate_image_with_gemini(&infographic_prompt, &[], infographic_config, false).await {
         Ok(images) => {
