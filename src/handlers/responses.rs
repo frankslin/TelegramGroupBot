@@ -9,7 +9,6 @@ use crate::config::CONFIG;
 use crate::db::database::build_message_insert;
 use crate::handlers::content::create_telegraph_page;
 use crate::state::AppState;
-use crate::utils::language::detect_language_or_fallback;
 
 async fn edit_text_with_retry(
     bot: &Bot,
@@ -100,12 +99,6 @@ pub async fn log_message(state: &AppState, message: &Message) {
         return;
     };
 
-    let user_language_code = message
-        .from
-        .as_ref()
-        .and_then(|user| user.language_code.as_deref());
-    let language = detect_language_or_fallback(&[&text], user_language_code, "Chinese");
-
     let username = if let Some(user) = message.from.as_ref() {
         if !user.full_name().is_empty() {
             user.full_name()
@@ -125,7 +118,7 @@ pub async fn log_message(state: &AppState, message: &Message) {
             .and_then(|user| i64::try_from(user.id.0).ok()),
         Some(username),
         Some(text),
-        Some(language),
+        None,
         message.date,
         message.reply_to_message().map(|msg| msg.id.0 as i64),
         Some(message.chat.id.0),

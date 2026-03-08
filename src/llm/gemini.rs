@@ -961,7 +961,6 @@ async fn call_gemini_lite_fallback(
 pub async fn call_gemini(
     system_prompt: &str,
     user_content: &str,
-    response_language: Option<&str>,
     use_search_grounding: bool,
     _use_url_context: bool,
     _thinking_level: Option<&str>,
@@ -971,10 +970,7 @@ pub async fn call_gemini(
     youtube_urls: Option<Vec<String>>,
     system_prompt_label: Option<&str>,
 ) -> Result<GeminiCallResult> {
-    let mut content = user_content.to_string();
-    if let Some(lang) = response_language {
-        content.push_str(&format!("\n\nPlease reply in {}.", lang));
-    }
+    let content = user_content.to_string();
 
     let youtube_urls = youtube_urls.unwrap_or_default();
 

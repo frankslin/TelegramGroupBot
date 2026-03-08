@@ -16,7 +16,7 @@ pub struct PendingQRequest {
     pub query: String,
     pub original_query: String,
     pub db_query_text: String,
-    pub language: String,
+    pub telegram_language_code: Option<String>,
     pub media_files: Vec<MediaFile>,
     pub youtube_urls: Vec<String>,
     pub telegraph_contents: Vec<String>,

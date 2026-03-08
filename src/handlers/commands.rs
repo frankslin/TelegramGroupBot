@@ -21,6 +21,7 @@ use crate::handlers::content::{
 };
 use crate::handlers::media::{
     collect_message_media, get_file_url, summarize_media_files, MediaCollectionOptions,
+    MediaSummary,
 };
 use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
@@ -72,6 +73,55 @@ fn message_entities_for_text(message: &Message) -> Option<Vec<MessageEntityRef<'
     } else {
         message.parse_caption_entities()
     }
+}
+
+fn build_factcheck_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    FACTCHECK_SYSTEM_PROMPT
+        .replace("{current_datetime}", &now)
+        .replace(
+            "{telegram_user_language_hint}",
+            telegram_user_language_hint.unwrap_or("unknown"),
+        )
+}
+
+fn build_factcheck_statement(
+    query_text: &str,
+    reply_text: &str,
+    media_summary: &MediaSummary,
+) -> String {
+    let query_text = query_text.trim();
+    let reply_text = reply_text.trim();
+
+    if !query_text.is_empty() && !reply_text.is_empty() {
+        return format!(
+            "<reply_context>\n{}\n</reply_context>\n\n<factcheck_target>\n{}\n</factcheck_target>",
+            reply_text, query_text
+        );
+    }
+
+    if !query_text.is_empty() {
+        return format!("<factcheck_target>\n{}\n</factcheck_target>", query_text);
+    }
+
+    if !reply_text.is_empty() {
+        return format!("<factcheck_target>\n{}\n</factcheck_target>", reply_text);
+    }
+
+    if media_summary.videos > 0 {
+        return "<auto_factcheck_target source=\"media_only\" kind=\"video\" />".to_string();
+    }
+    if media_summary.audios > 0 {
+        return "<auto_factcheck_target source=\"media_only\" kind=\"audio\" />".to_string();
+    }
+    if media_summary.images > 0 {
+        return "<auto_factcheck_target source=\"media_only\" kind=\"image\" />".to_string();
+    }
+    if media_summary.documents > 0 {
+        return "<auto_factcheck_target source=\"media_only\" kind=\"document\" />".to_string();
+    }
+
+    String::new()
 }
 
 fn escape_html(text: &str) -> String {
@@ -1135,7 +1185,6 @@ pub async fn tldr_handler(
     let response = match call_gemini(
         &system_prompt,
         &chat_content,
-        None,
         true,
         false,
         Some(&CONFIG.gemini_thinking_level),
@@ -1302,6 +1351,10 @@ pub async fn factcheck_handler(
     let reply_message = message.reply_to_message();
     let mut query_text = query.unwrap_or_default();
     let query_entities = message_entities_for_text(&message);
+    let user_language_code = message
+        .from
+        .as_ref()
+        .and_then(|user| user.language_code.as_deref());
     let mut telegraph_contents = Vec::new();
     let mut twitter_contents = Vec::new();
 
@@ -1339,17 +1392,6 @@ pub async fn factcheck_handler(
         query_text = query_text_processed;
     }
 
-    let mut statement = if query_text.trim().is_empty() {
-        reply_text.clone()
-    } else if reply_text.trim().is_empty() {
-        query_text
-    } else {
-        format!(
-            "Context from replied message: \"{}\"\n\nStatement: {}",
-            reply_text, query_text
-        )
-    };
-
     let mut media_options = MediaCollectionOptions::for_commands();
     media_options.include_reply = true;
     let max_files = media_options.max_files;
@@ -1372,29 +1414,13 @@ pub async fn factcheck_handler(
     }
 
     let media_summary = summarize_media_files(&media_files);
+    let statement = build_factcheck_statement(&query_text, &reply_text, &media_summary);
 
     if statement.trim().is_empty() {
-        if media_summary.videos > 0 {
-            statement =
-                "Please analyze this video and fact-check any claims or content shown in it."
-                    .to_string();
-        } else if media_summary.audios > 0 {
-            statement =
-                "Please analyze this audio and fact-check any claims or content shown in it."
-                    .to_string();
-        } else if media_summary.images > 0 {
-            statement =
-                "Please analyze these images and fact-check any claims or content shown in them."
-                    .to_string();
-        } else if media_summary.documents > 0 {
-            statement = "Please analyze these documents and fact-check any claims or content shown in them."
-                .to_string();
-        } else {
-            bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
-                .reply_parameters(ReplyParameters::new(message.id))
-                .await?;
-            return Ok(());
-        }
+        bot.send_message(message.chat.id, "Please reply to a message to fact-check.")
+            .reply_parameters(ReplyParameters::new(message.id))
+            .await?;
+        return Ok(());
     }
 
     let mut processing_message_text = if media_summary.videos > 0 {
@@ -1497,12 +1523,10 @@ pub async fn factcheck_handler(
         .await?;
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let system_prompt = FACTCHECK_SYSTEM_PROMPT.replace("{current_datetime}", &now);
+    let system_prompt = build_factcheck_system_prompt(user_language_code);
     let response = match call_gemini(
         &system_prompt,
         &statement,
-        None,
         true,
         false,
         Some(&CONFIG.gemini_thinking_level),
@@ -1618,7 +1642,6 @@ pub async fn profileme_handler(
     let response = call_gemini(
         &system_prompt,
         &formatted_history,
-        None,
         false,
         false,
         Some(&CONFIG.gemini_thinking_level),
@@ -1711,7 +1734,6 @@ pub async fn paintme_handler(
     let prompt = call_gemini(
         prompt_system,
         &formatted_history,
-        None,
         false,
         false,
         Some(&CONFIG.gemini_thinking_level),

@@ -22,7 +22,6 @@ use crate::handlers::responses::send_response;
 use crate::llm::media::MediaKind;
 use crate::llm::{call_gemini, call_openrouter};
 use crate::state::{AppState, PendingQRequest};
-use crate::utils::language::detect_language_or_fallback;
 use crate::utils::telegram::start_chat_action_heartbeat;
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::warn;
@@ -404,11 +403,12 @@ pub fn create_model_selection_keyboard(
     InlineKeyboardMarkup::new(keyboard)
 }
 
-fn build_system_prompt(language: &str) -> String {
+fn build_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    Q_SYSTEM_PROMPT
-        .replace("{current_datetime}", &now)
-        .replace("{language}", language)
+    Q_SYSTEM_PROMPT.replace("{current_datetime}", &now).replace(
+        "{telegram_user_language_hint}",
+        telegram_user_language_hint.unwrap_or("unknown"),
+    )
 }
 
 #[allow(deprecated)]
@@ -418,7 +418,7 @@ async fn process_request(
     request: PendingQRequest,
     model_name: &str,
 ) -> Result<()> {
-    let system_prompt = build_system_prompt(&request.language);
+    let system_prompt = build_system_prompt(request.telegram_language_code.as_deref());
 
     let mut query = request.query.clone();
     for content in &request.telegraph_contents {
@@ -447,7 +447,6 @@ async fn process_request(
         call_gemini(
             &system_prompt,
             &query,
-            Some(&request.language),
             true,
             false,
             Some(&CONFIG.gemini_thinking_level),
@@ -632,11 +631,6 @@ pub async fn q_handler(
         .from
         .as_ref()
         .and_then(|user| user.language_code.as_deref());
-    let language = detect_language_or_fallback(
-        &[&original_query, &query_text, &reply_text],
-        user_language_code,
-        "Chinese",
-    );
 
     let username = message
         .from
@@ -738,9 +732,8 @@ pub async fn q_handler(
             media_summary.total > 0 || !youtube_urls.is_empty()
         };
         let response = call_gemini(
-            &build_system_prompt(&language),
+            &build_system_prompt(user_language_code),
             &query_text,
-            Some(&language),
             true,
             false,
             Some(&CONFIG.gemini_thinking_level),
@@ -800,7 +793,7 @@ pub async fn q_handler(
         query: query_text.clone(),
         original_query: original_query.clone(),
         db_query_text: db_query_text.clone(),
-        language: language.clone(),
+        telegram_language_code: user_language_code.map(str::to_string),
         media_files,
         youtube_urls,
         telegraph_contents: telegraph_contents
@@ -843,7 +836,7 @@ pub async fn q_handler(
             },
             db_query_text
         )),
-        Some(language),
+        None,
         message.date,
         message.reply_to_message().map(|msg| msg.id.0 as i64),
         Some(message.chat.id.0),
