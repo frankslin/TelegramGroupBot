@@ -7,3 +7,6 @@ agent_logs/
 feature_plans/
 whitelist.txt
 openrouter_models.json
+agent_workspace/
+third_party_models.json
+acl.json
