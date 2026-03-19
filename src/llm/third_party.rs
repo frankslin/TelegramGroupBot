@@ -6,13 +6,34 @@ use regex::Regex;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
-use crate::config::CONFIG;
+use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::get_http_client;
 use crate::utils::timing::log_llm_timing;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const TOOL_LIMIT_SYSTEM_PROMPT: &str = "Tool call limit reached. Provide the best possible answer using the available information without requesting more tool calls.";
+const OPENROUTER_REFERER: &str = "https://github.com/sailself/TelegramGroupHelperBot";
+const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
+
+#[derive(Debug, Clone)]
+struct ProviderRuntimeConfig {
+    provider: ThirdPartyProvider,
+    display_name: &'static str,
+    base_url: String,
+    api_key: String,
+    temperature: f32,
+    top_p: f32,
+    top_k: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderRequestDetails {
+    display_name: &'static str,
+    url: String,
+    headers: Vec<(String, String)>,
+    payload: Value,
+}
 
 fn truncate_for_log(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
@@ -113,11 +134,16 @@ fn parse_qwen_content(content: &str) -> String {
     content.trim().to_string()
 }
 
-fn parse_openrouter_response(model_name: &str, content: &str) -> String {
-    if model_name == CONFIG.gpt_model {
+fn parse_third_party_response(model_config: &ThirdPartyModelConfig, content: &str) -> String {
+    if model_config.provider != ThirdPartyProvider::OpenRouter {
+        return content.to_string();
+    }
+
+    let haystack = format!("{} {}", model_config.name, model_config.model).to_lowercase();
+    if haystack.contains("gpt") {
         return parse_gpt_content(content);
     }
-    if model_name == CONFIG.qwen_model {
+    if haystack.contains("qwen") {
         return parse_qwen_content(content);
     }
     content.to_string()
@@ -150,7 +176,7 @@ fn extract_reasoning_text(message: &Value) -> Option<String> {
     }
 }
 
-fn extract_openrouter_content(message: &Value) -> String {
+fn extract_message_content(message: &Value) -> String {
     let content = message
         .get("content")
         .and_then(|v| v.as_str())
@@ -220,40 +246,120 @@ fn build_message_content(user_content: &str, image_data_list: &[Vec<u8>]) -> Val
     Value::Array(parts)
 }
 
-async fn call_openrouter_api(payload: &Value) -> Result<Value> {
-    debug!("OpenRouter request: {}", summarize_payload(payload));
+fn provider_runtime_config(provider: ThirdPartyProvider) -> Result<ProviderRuntimeConfig> {
+    let config = match provider {
+        ThirdPartyProvider::OpenRouter => ProviderRuntimeConfig {
+            provider,
+            display_name: "OpenRouter",
+            base_url: CONFIG.openrouter_base_url.clone(),
+            api_key: CONFIG.openrouter_api_key.clone(),
+            temperature: CONFIG.openrouter_temperature,
+            top_p: CONFIG.openrouter_top_p,
+            top_k: Some(CONFIG.openrouter_top_k),
+        },
+        ThirdPartyProvider::Nvidia => ProviderRuntimeConfig {
+            provider,
+            display_name: "NVIDIA",
+            base_url: CONFIG.nvidia_base_url.clone(),
+            api_key: CONFIG.nvidia_api_key.clone(),
+            temperature: CONFIG.nvidia_temperature,
+            top_p: CONFIG.nvidia_top_p,
+            top_k: None,
+        },
+    };
+
+    if !CONFIG.is_third_party_provider_ready(provider) {
+        return Err(anyhow!(
+            "{} is not enabled or its API key is missing",
+            config.display_name
+        ));
+    }
+
+    Ok(config)
+}
+
+fn build_request_details_for_runtime(
+    model_config: &ThirdPartyModelConfig,
+    runtime: &ProviderRuntimeConfig,
+    messages: Vec<Value>,
+    tools: Option<Vec<Value>>,
+    tool_choice: Option<&str>,
+) -> ProviderRequestDetails {
+    let mut headers = vec![(
+        "Authorization".to_string(),
+        format!("Bearer {}", runtime.api_key),
+    )];
+    if runtime.provider == ThirdPartyProvider::OpenRouter {
+        headers.push(("HTTP-Referer".to_string(), OPENROUTER_REFERER.to_string()));
+        headers.push(("X-Title".to_string(), OPENROUTER_TITLE.to_string()));
+    }
+
+    let mut payload = json!({
+        "model": model_config.model,
+        "messages": messages,
+        "temperature": runtime.temperature,
+        "top_p": runtime.top_p,
+    });
+
+    if let Some(top_k) = runtime.top_k {
+        payload["top_k"] = json!(top_k);
+    }
+
+    if let Some(tools) = tools {
+        payload["tools"] = Value::Array(tools);
+        payload["tool_choice"] = Value::String(tool_choice.unwrap_or("auto").to_string());
+    }
+
+    ProviderRequestDetails {
+        display_name: runtime.display_name,
+        url: format!("{}/chat/completions", runtime.base_url.trim_end_matches('/')),
+        headers,
+        payload,
+    }
+}
+
+fn build_request_details(
+    model_config: &ThirdPartyModelConfig,
+    messages: Vec<Value>,
+    tools: Option<Vec<Value>>,
+    tool_choice: Option<&str>,
+) -> Result<ProviderRequestDetails> {
+    let runtime = provider_runtime_config(model_config.provider)?;
+    Ok(build_request_details_for_runtime(
+        model_config,
+        &runtime,
+        messages,
+        tools,
+        tool_choice,
+    ))
+}
+
+async fn call_provider_api(details: &ProviderRequestDetails) -> Result<Value> {
+    debug!(
+        "{} request: {}",
+        details.display_name,
+        summarize_payload(&details.payload)
+    );
 
     let client = get_http_client();
-    let response = client
-        .post(format!(
-            "{}/chat/completions",
-            CONFIG.openrouter_base_url.trim_end_matches('/')
-        ))
-        .header(
-            "Authorization",
-            format!("Bearer {}", CONFIG.openrouter_api_key),
-        )
-        .header(
-            "HTTP-Referer",
-            "https://github.com/sailself/TelegramGroupHelperBot",
-        )
-        .header("X-Title", "TelegramGroupHelperBot")
-        .timeout(Duration::from_secs(60))
-        .json(payload)
-        .send()
-        .await?;
+    let mut request = client.post(&details.url).timeout(Duration::from_secs(60));
+    for (name, value) in &details.headers {
+        request = request.header(name, value);
+    }
+    let response = request.json(&details.payload).send().await?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         let (message, body_summary) = summarize_error_body(&body);
         warn!(
-            "OpenRouter API error: status={}, body={}",
-            status, body_summary
+            "{} API error: status={}, body={}",
+            details.display_name, status, body_summary
         );
         let detail = message.unwrap_or(body_summary);
         return Err(anyhow!(
-            "OpenRouter request failed with status {}: {}",
+            "{} request failed with status {}: {}",
+            details.display_name,
             status,
             detail
         ));
@@ -261,8 +367,10 @@ async fn call_openrouter_api(payload: &Value) -> Result<Value> {
 
     let value = response.json::<Value>().await?;
     debug!(
-        "OpenRouter response received for model={}",
-        payload
+        "{} response received for model={}",
+        details.display_name,
+        details
+            .payload
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
@@ -301,32 +409,23 @@ async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> 
     }
 }
 
-async fn chat_completion_with_tools(
-    mut messages: Vec<Value>,
-    model_name: &str,
-    temperature: f32,
-    top_p: f32,
-    top_k: i32,
-) -> Result<String> {
+async fn chat_completion_with_tools(mut messages: Vec<Value>, model_config: &ThirdPartyModelConfig) -> Result<String> {
     let tools = build_function_tools();
 
     for iteration in 0..MAX_TOOL_CALL_ITERATIONS {
         debug!(
-            "OpenRouter tool iteration {}/{}",
+            "{} tool iteration {}/{}",
+            model_config.provider.as_str(),
             iteration + 1,
             MAX_TOOL_CALL_ITERATIONS
         );
-        let payload = json!({
-            "model": model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "tools": tools,
-            "tool_choice": "auto"
-        });
-
-        let response = call_openrouter_api(&payload).await?;
+        let details = build_request_details(
+            model_config,
+            messages.clone(),
+            Some(tools.clone()),
+            Some("auto"),
+        )?;
+        let response = call_provider_api(&details).await?;
         let message = response
             .get("choices")
             .and_then(|v| v.get(0))
@@ -334,7 +433,7 @@ async fn chat_completion_with_tools(
             .cloned()
             .unwrap_or(Value::Null);
 
-        let content = extract_openrouter_content(&message);
+        let content = extract_message_content(&message);
         let tool_calls = message
             .get("tool_calls")
             .and_then(|v| v.as_array())
@@ -344,11 +443,12 @@ async fn chat_completion_with_tools(
         if tool_calls.is_empty() {
             if content.trim().is_empty() {
                 warn!(
-                    "OpenRouter response had empty content and no tool calls: {}",
+                    "{} response had empty content and no tool calls: {}",
+                    details.display_name,
                     truncate_for_log(&response.to_string(), 2000)
                 );
             }
-            return Ok(parse_openrouter_response(model_name, &content));
+            return Ok(parse_third_party_response(model_config, &content));
         }
 
         messages.push(message.clone());
@@ -390,18 +490,22 @@ async fn chat_completion_with_tools(
     Ok("".to_string())
 }
 
-pub async fn call_openrouter(
+pub async fn call_third_party(
     system_prompt: &str,
     user_content: &str,
-    model_identifier: &str,
+    model_id: &str,
     response_title: &str,
     image_data_list: &[Vec<u8>],
     supports_tools: bool,
 ) -> Result<String> {
-    if model_identifier.trim().is_empty() {
+    if model_id.trim().is_empty() {
         return Err(anyhow!("Model identifier is required"));
     }
 
+    let model_config = CONFIG
+        .get_third_party_model_config(model_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))?;
     let message_content = build_message_content(user_content, image_data_list);
 
     let messages = vec![
@@ -409,44 +513,124 @@ pub async fn call_openrouter(
         json!({ "role": "user", "content": message_content }),
     ];
 
-    let operation = format!("openrouter:{}", response_title);
-    let model_name = model_identifier.to_string();
+    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
 
     if supports_tools && web_search::is_search_enabled() {
-        return log_llm_timing("openrouter", &model_name, &operation, None, || async {
-            chat_completion_with_tools(
-                messages,
-                &model_name,
-                CONFIG.openrouter_temperature,
-                CONFIG.openrouter_top_p,
-                CONFIG.openrouter_top_k,
-            )
-            .await
-            .map_err(|err| anyhow!(err))
-        })
+        return log_llm_timing(
+            model_config.provider.as_str(),
+            &model_config.id,
+            &operation,
+            None,
+            || async { chat_completion_with_tools(messages, &model_config).await.map_err(|err| anyhow!(err)) },
+        )
         .await;
     }
 
-    let payload = json!({
-        "model": model_name,
-        "messages": messages,
-        "temperature": CONFIG.openrouter_temperature,
-        "top_p": CONFIG.openrouter_top_p,
-        "top_k": CONFIG.openrouter_top_k,
-    });
+    let details = build_request_details(&model_config, messages, None, None)?;
+    let model_id = model_config.id.clone();
+    let result = log_llm_timing(
+        model_config.provider.as_str(),
+        &model_id,
+        &operation,
+        None,
+        || async {
+            let response = call_provider_api(&details).await?;
+            let content = response
+                .get("choices")
+                .and_then(|v| v.get(0))
+                .and_then(|v| v.get("message"))
+                .map(extract_message_content)
+                .unwrap_or_default();
+            Ok(parse_third_party_response(&model_config, &content))
+        })
+        .await;
+    result
+}
 
-    let result = log_llm_timing("openrouter", model_identifier, &operation, None, || async {
-        let response = call_openrouter_api(&payload).await?;
-        let content = response
-            .get("choices")
-            .and_then(|v| v.get(0))
-            .and_then(|v| v.get("message"))
-            .and_then(|v| v.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        Ok(parse_openrouter_response(model_identifier, content))
-    })
-    .await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Ok(result)
+    fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPartyModelConfig {
+        ThirdPartyModelConfig {
+            id: format!("{}:{}", provider.as_str(), raw_model),
+            provider,
+            name: name.to_string(),
+            model: raw_model.to_string(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: true,
+        }
+    }
+
+    #[test]
+    fn openrouter_request_details_keep_headers_and_top_k() {
+        let runtime = ProviderRuntimeConfig {
+            provider: ThirdPartyProvider::OpenRouter,
+            display_name: "OpenRouter",
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: "test-openrouter".to_string(),
+            temperature: 0.7,
+            top_p: 0.95,
+            top_k: Some(40),
+        };
+        let details = build_request_details_for_runtime(
+            &model(ThirdPartyProvider::OpenRouter, "Qwen 3", "qwen/qwen3-next-80b-a3b-instruct:free"),
+            &runtime,
+            vec![json!({ "role": "user", "content": "hello" })],
+            None,
+            None,
+        );
+
+        assert_eq!(
+            details.url,
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        assert!(
+            details
+                .headers
+                .iter()
+                .any(|(name, value)| name == "HTTP-Referer" && value == OPENROUTER_REFERER)
+        );
+        assert!(
+            details
+                .headers
+                .iter()
+                .any(|(name, value)| name == "X-Title" && value == OPENROUTER_TITLE)
+        );
+        assert_eq!(details.payload.get("top_k").and_then(|v| v.as_i64()), Some(40));
+    }
+
+    #[test]
+    fn nvidia_request_details_omit_top_k_and_openrouter_headers() {
+        let runtime = ProviderRuntimeConfig {
+            provider: ThirdPartyProvider::Nvidia,
+            display_name: "NVIDIA",
+            base_url: "https://integrate.api.nvidia.com/v1".to_string(),
+            api_key: "test-nvidia".to_string(),
+            temperature: 0.4,
+            top_p: 0.8,
+            top_k: None,
+        };
+        let details = build_request_details_for_runtime(
+            &model(ThirdPartyProvider::Nvidia, "Gemma 3n", "google/gemma-3n-e4b-it"),
+            &runtime,
+            vec![json!({ "role": "user", "content": "hello" })],
+            None,
+            None,
+        );
+
+        assert_eq!(
+            details.url,
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+        assert!(
+            !details
+                .headers
+                .iter()
+                .any(|(name, _)| name == "HTTP-Referer" || name == "X-Title")
+        );
+        assert!(details.payload.get("top_k").is_none());
+    }
 }

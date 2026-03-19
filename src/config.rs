@@ -16,13 +16,45 @@ pub struct ModelCapabilities {
     pub audio: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct OpenRouterModelsFile {
-    models: Vec<OpenRouterModelEntry>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThirdPartyProvider {
+    OpenRouter,
+    Nvidia,
+}
+
+impl ThirdPartyProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThirdPartyProvider::OpenRouter => "openrouter",
+            ThirdPartyProvider::Nvidia => "nvidia",
+        }
+    }
+}
+
+impl std::str::FromStr for ThirdPartyProvider {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "openrouter" => Ok(ThirdPartyProvider::OpenRouter),
+            "nvidia" => Ok(ThirdPartyProvider::Nvidia),
+            other => Err(anyhow::anyhow!(
+                "Unsupported third-party model provider '{}'",
+                other
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct OpenRouterModelEntry {
+struct ThirdPartyModelsFile {
+    models: Vec<ThirdPartyModelEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ThirdPartyModelEntry {
+    provider: ThirdPartyProvider,
     name: String,
     model: String,
     #[serde(default)]
@@ -36,7 +68,9 @@ struct OpenRouterModelEntry {
 }
 
 #[derive(Debug, Clone)]
-pub struct OpenRouterModelConfig {
+pub struct ThirdPartyModelConfig {
+    pub id: String,
+    pub provider: ThirdPartyProvider,
     pub name: String,
     pub model: String,
     pub image: bool,
@@ -45,7 +79,7 @@ pub struct OpenRouterModelConfig {
     pub tools: bool,
 }
 
-impl OpenRouterModelConfig {
+impl ThirdPartyModelConfig {
     #[allow(dead_code)]
     pub fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities {
@@ -53,6 +87,21 @@ impl OpenRouterModelConfig {
             video: self.video,
             audio: self.audio,
         }
+    }
+}
+
+pub fn qualify_third_party_model_id(provider: ThirdPartyProvider, model: &str) -> String {
+    format!("{}:{}", provider.as_str(), model.trim())
+}
+
+pub fn parse_third_party_model_id(identifier: &str) -> Option<(ThirdPartyProvider, &str)> {
+    let (provider, model) = identifier.trim().split_once(':')?;
+    let provider = provider.parse().ok()?;
+    let model = model.trim();
+    if model.is_empty() {
+        None
+    } else {
+        Some((provider, model))
     }
 }
 
@@ -81,6 +130,12 @@ pub struct Config {
     pub openrouter_temperature: f32,
     pub openrouter_top_k: i32,
     pub openrouter_top_p: f32,
+    pub enable_nvidia: bool,
+    pub nvidia_api_key: String,
+    pub nvidia_base_url: String,
+    pub nvidia_temperature: f32,
+    pub nvidia_top_k: i32,
+    pub nvidia_top_p: f32,
     pub enable_jina_mcp: bool,
     pub jina_ai_api_key: String,
     pub jina_search_endpoint: String,
@@ -111,9 +166,9 @@ pub struct Config {
     pub support_link: String,
     pub whitelist_file_path: String,
     pub access_controlled_commands: Vec<String>,
-    pub openrouter_models_config_path: PathBuf,
-    pub openrouter_models: Vec<OpenRouterModelConfig>,
-    pub openrouter_models_by_model: HashMap<String, OpenRouterModelConfig>,
+    pub third_party_models_config_path: PathBuf,
+    pub third_party_models: Vec<ThirdPartyModelConfig>,
+    pub third_party_models_by_id: HashMap<String, ThirdPartyModelConfig>,
 }
 
 pub static CONFIG: Lazy<Config> =
@@ -194,9 +249,9 @@ fn normalize_gemini_safety_settings(value: String) -> String {
     }
 }
 
-fn resolve_openrouter_models_path() -> PathBuf {
+fn resolve_third_party_models_path() -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(env_value) = env::var("OPENROUTER_MODELS_CONFIG_PATH") {
+    if let Ok(env_value) = env::var("THIRD_PARTY_MODELS_CONFIG_PATH") {
         let env_path = PathBuf::from(env_value);
         if env_path.is_absolute() {
             candidates.push(env_path);
@@ -207,8 +262,8 @@ fn resolve_openrouter_models_path() -> PathBuf {
             );
         }
     }
-    candidates.push(PathBuf::from("openrouter_models.json"));
-    candidates.push(PathBuf::from("bot").join("openrouter_models.json"));
+    candidates.push(PathBuf::from("third_party_models.json"));
+    candidates.push(PathBuf::from("bot").join("third_party_models.json"));
 
     for candidate in &candidates {
         if candidate.exists() {
@@ -219,35 +274,35 @@ fn resolve_openrouter_models_path() -> PathBuf {
     candidates
         .get(0)
         .cloned()
-        .unwrap_or_else(|| PathBuf::from("openrouter_models.json"))
+        .unwrap_or_else(|| PathBuf::from("third_party_models.json"))
 }
 
-fn load_openrouter_models_from_path(path: &Path) -> Vec<OpenRouterModelConfig> {
-    if !path.exists() {
-        info!("OpenRouter model config not found at {}", path.display());
-        return Vec::new();
+fn build_third_party_model_config(
+    provider: ThirdPartyProvider,
+    name: &str,
+    model: &str,
+    image: bool,
+    video: bool,
+    audio: bool,
+    tools: bool,
+) -> ThirdPartyModelConfig {
+    ThirdPartyModelConfig {
+        id: qualify_third_party_model_id(provider, model),
+        provider,
+        name: name.to_string(),
+        model: model.to_string(),
+        image,
+        video,
+        audio,
+        tools,
     }
+}
 
-    let raw = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) => {
-            info!(
-                "Failed to read OpenRouter model config at {}: {}",
-                path.display(),
-                err
-            );
-            return Vec::new();
-        }
-    };
-
-    let parsed: OpenRouterModelsFile = match serde_json::from_str(&raw) {
+fn parse_third_party_models_from_str(raw: &str) -> Vec<ThirdPartyModelConfig> {
+    let parsed: ThirdPartyModelsFile = match serde_json::from_str(raw) {
         Ok(data) => data,
         Err(err) => {
-            info!(
-                "Failed to parse OpenRouter model config at {}: {}",
-                path.display(),
-                err
-            );
+            info!("Failed to parse third-party model config JSON: {}", err);
             return Vec::new();
         }
     };
@@ -259,19 +314,48 @@ fn load_openrouter_models_from_path(path: &Path) -> Vec<OpenRouterModelConfig> {
         if name.is_empty() || model.is_empty() {
             continue;
         }
-        models.push(OpenRouterModelConfig {
-            name: name.to_string(),
-            model: model.to_string(),
-            image: entry.image.unwrap_or(false),
-            video: entry.video.unwrap_or(false),
-            audio: entry.audio.unwrap_or(false),
-            tools: entry.tools.unwrap_or(true),
-        });
+        models.push(build_third_party_model_config(
+            entry.provider,
+            name,
+            model,
+            entry.image.unwrap_or(false),
+            entry.video.unwrap_or(false),
+            entry.audio.unwrap_or(false),
+            entry.tools.unwrap_or(true),
+        ));
     }
     models
 }
 
-fn load_legacy_openrouter_models(config: &LegacyOpenRouterEnv) -> Vec<OpenRouterModelConfig> {
+fn load_third_party_models_from_path(path: &Path) -> Vec<ThirdPartyModelConfig> {
+    if !path.exists() {
+        info!("Third-party model config not found at {}", path.display());
+        return Vec::new();
+    }
+
+    let raw = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            info!(
+                "Failed to read third-party model config at {}: {}",
+                path.display(),
+                err
+            );
+            return Vec::new();
+        }
+    };
+
+    let models = parse_third_party_models_from_str(&raw);
+    if models.is_empty() && !raw.trim().is_empty() {
+        info!(
+            "Parsed zero third-party models from {}",
+            path.display()
+        );
+    }
+    models
+}
+
+fn load_legacy_openrouter_models(config: &LegacyOpenRouterEnv) -> Vec<ThirdPartyModelConfig> {
     let legacy_entries: Vec<(&str, &str, bool, bool, bool, bool)> = vec![
         ("Llama 4", &config.llama_model, true, false, false, true),
         ("Grok 4", &config.grok_model, true, false, false, true),
@@ -290,27 +374,28 @@ fn load_legacy_openrouter_models(config: &LegacyOpenRouterEnv) -> Vec<OpenRouter
     let mut models = Vec::new();
     for (name, model_id, image, video, audio, tools) in legacy_entries {
         if !model_id.trim().is_empty() {
-            models.push(OpenRouterModelConfig {
-                name: name.to_string(),
-                model: model_id.to_string(),
+            models.push(build_third_party_model_config(
+                ThirdPartyProvider::OpenRouter,
+                name,
+                model_id.trim(),
                 image,
                 video,
                 audio,
                 tools,
-            });
+            ));
         }
     }
     models
 }
 
-fn build_openrouter_models(
+fn build_third_party_models(
     path: &Path,
     legacy_env: &LegacyOpenRouterEnv,
-) -> Vec<OpenRouterModelConfig> {
-    let models = load_openrouter_models_from_path(path);
+) -> Vec<ThirdPartyModelConfig> {
+    let models = load_third_party_models_from_path(path);
     if !models.is_empty() {
         info!(
-            "Loaded {} OpenRouter model(s) from {}",
+            "Loaded {} third-party model(s) from {}",
             models.len(),
             path.display()
         );
@@ -323,29 +408,69 @@ fn build_openrouter_models(
             legacy_models.len()
         );
     } else {
-        info!("No OpenRouter models configured via JSON or environment variables");
+        info!("No third-party models configured via JSON or legacy OpenRouter environment variables");
     }
     legacy_models
 }
 
+fn resolve_exact_model_identifier(
+    value: &str,
+    models: &[ThirdPartyModelConfig],
+    default_provider: Option<ThirdPartyProvider>,
+) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed.eq_ignore_ascii_case("gemini") {
+        return "gemini".to_string();
+    }
+
+    if let Some((provider, model)) = parse_third_party_model_id(trimmed) {
+        return qualify_third_party_model_id(provider, model);
+    }
+
+    let exact_matches = models
+        .iter()
+        .filter(|config_entry| config_entry.model == trimmed)
+        .collect::<Vec<_>>();
+    if exact_matches.len() == 1 {
+        return exact_matches[0].id.clone();
+    }
+
+    if let Some(provider) = default_provider {
+        return qualify_third_party_model_id(provider, trimmed);
+    }
+
+    trimmed.to_string()
+}
+
 fn resolve_model_by_keyword(
     value: &str,
-    models: &[OpenRouterModelConfig],
+    models: &[ThirdPartyModelConfig],
     keywords: &[&str],
+    default_provider: Option<ThirdPartyProvider>,
 ) -> String {
     if !value.trim().is_empty() {
-        return value.to_string();
+        return resolve_exact_model_identifier(value, models, default_provider);
     }
 
     let lowered: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
     for config_entry in models {
-        let haystack = format!("{} {}", config_entry.name, config_entry.model).to_lowercase();
+        let haystack = format!(
+            "{} {} {}",
+            config_entry.provider.as_str(),
+            config_entry.name,
+            config_entry.model
+        )
+        .to_lowercase();
         if lowered.iter().all(|keyword| haystack.contains(keyword)) {
-            return config_entry.model.clone();
+            return config_entry.id.clone();
         }
     }
 
-    value.to_string()
+    resolve_exact_model_identifier(value, models, default_provider)
 }
 
 #[derive(Debug, Clone)]
@@ -372,28 +497,45 @@ impl Config {
             gpt_model: env_string("GPT_MODEL", ""),
         };
 
-        let openrouter_models_config_path = resolve_openrouter_models_path();
-        let openrouter_models =
-            build_openrouter_models(&openrouter_models_config_path, &legacy_env);
-        let openrouter_models_by_model = openrouter_models
+        let third_party_models_config_path = resolve_third_party_models_path();
+        let third_party_models =
+            build_third_party_models(&third_party_models_config_path, &legacy_env);
+        let third_party_models_by_id = third_party_models
             .iter()
             .cloned()
-            .map(|model| (model.model.clone(), model))
+            .map(|model| (model.id.clone(), model))
             .collect::<HashMap<_, _>>();
 
-        let llama_model =
-            resolve_model_by_keyword(&legacy_env.llama_model, &openrouter_models, &["llama"]);
-        let grok_model =
-            resolve_model_by_keyword(&legacy_env.grok_model, &openrouter_models, &["grok"]);
-        let qwen_model =
-            resolve_model_by_keyword(&legacy_env.qwen_model, &openrouter_models, &["qwen"]);
+        let llama_model = resolve_model_by_keyword(
+            &legacy_env.llama_model,
+            &third_party_models,
+            &["llama"],
+            Some(ThirdPartyProvider::OpenRouter),
+        );
+        let grok_model = resolve_model_by_keyword(
+            &legacy_env.grok_model,
+            &third_party_models,
+            &["grok"],
+            Some(ThirdPartyProvider::OpenRouter),
+        );
+        let qwen_model = resolve_model_by_keyword(
+            &legacy_env.qwen_model,
+            &third_party_models,
+            &["qwen"],
+            Some(ThirdPartyProvider::OpenRouter),
+        );
         let deepseek_model = resolve_model_by_keyword(
             &legacy_env.deepseek_model,
-            &openrouter_models,
+            &third_party_models,
             &["deepseek"],
+            Some(ThirdPartyProvider::OpenRouter),
         );
-        let gpt_model =
-            resolve_model_by_keyword(&legacy_env.gpt_model, &openrouter_models, &["gpt"]);
+        let gpt_model = resolve_model_by_keyword(
+            &legacy_env.gpt_model,
+            &third_party_models,
+            &["gpt"],
+            Some(ThirdPartyProvider::OpenRouter),
+        );
 
         let access_controlled_commands = env::var("ACCESS_CONTROLLED_COMMANDS")
             .ok()
@@ -443,6 +585,12 @@ impl Config {
             openrouter_temperature: env_f32("OPENROUTER_TEMPERATURE", 0.7),
             openrouter_top_k: env_i32("OPENROUTER_TOP_K", 40),
             openrouter_top_p: env_f32("OPENROUTER_TOP_P", 0.95),
+            enable_nvidia: env_bool("ENABLE_NVIDIA", true),
+            nvidia_api_key: env_string("NVIDIA_API_KEY", ""),
+            nvidia_base_url: env_string("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+            nvidia_temperature: env_f32("NVIDIA_TEMPERATURE", 0.7),
+            nvidia_top_k: env_i32("NVIDIA_TOP_K", 40),
+            nvidia_top_p: env_f32("NVIDIA_TOP_P", 0.95),
             enable_jina_mcp: env_bool("ENABLE_JINA_MCP", false),
             jina_ai_api_key: env_string("JINA_AI_API_KEY", ""),
             jina_search_endpoint: env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
@@ -479,18 +627,32 @@ impl Config {
             support_link: env_string("SUPPORT_LINK", ""),
             whitelist_file_path: env_string("WHITELIST_FILE_PATH", "allowed_chat.txt"),
             access_controlled_commands,
-            openrouter_models_config_path,
-            openrouter_models,
-            openrouter_models_by_model,
+            third_party_models_config_path,
+            third_party_models,
+            third_party_models_by_id,
         })
     }
 
-    pub fn iter_openrouter_models(&self) -> &[OpenRouterModelConfig] {
-        &self.openrouter_models
+    pub fn iter_third_party_models(&self) -> &[ThirdPartyModelConfig] {
+        &self.third_party_models
     }
 
-    pub fn get_openrouter_model_config(&self, model_name: &str) -> Option<&OpenRouterModelConfig> {
-        self.openrouter_models_by_model.get(model_name)
+    pub fn get_third_party_model_config(
+        &self,
+        model_id: &str,
+    ) -> Option<&ThirdPartyModelConfig> {
+        self.third_party_models_by_id.get(model_id)
+    }
+
+    pub fn is_third_party_provider_ready(&self, provider: ThirdPartyProvider) -> bool {
+        match provider {
+            ThirdPartyProvider::OpenRouter => {
+                self.enable_openrouter && !self.openrouter_api_key.trim().is_empty()
+            }
+            ThirdPartyProvider::Nvidia => {
+                self.enable_nvidia && !self.nvidia_api_key.trim().is_empty()
+            }
+        }
     }
 }
 
@@ -549,6 +711,142 @@ You must output a single valid JSON object.
 
 ### OUTPUT
 Return ONLY the raw JSON string."#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_third_party_models_supports_mixed_providers() {
+        let raw = r#"{
+            "models": [
+                {
+                    "provider": "openrouter",
+                    "name": "Qwen 3",
+                    "model": "qwen/qwen3-next-80b-a3b-instruct:free",
+                    "tools": true
+                },
+                {
+                    "provider": "nvidia",
+                    "name": "Gemma 3n",
+                    "model": "google/gemma-3n-e4b-it",
+                    "image": true,
+                    "audio": true,
+                    "tools": false
+                }
+            ]
+        }"#;
+
+        let models = parse_third_party_models_from_str(raw);
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[0].id,
+            "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"
+        );
+        assert_eq!(models[0].provider, ThirdPartyProvider::OpenRouter);
+        assert_eq!(models[1].id, "nvidia:google/gemma-3n-e4b-it");
+        assert_eq!(models[1].provider, ThirdPartyProvider::Nvidia);
+        assert!(models[1].image);
+        assert!(models[1].audio);
+        assert!(!models[1].tools);
+    }
+
+    #[test]
+    fn provider_qualified_ids_disambiguate_duplicate_raw_model_ids() {
+        let raw = r#"{
+            "models": [
+                {
+                    "provider": "openrouter",
+                    "name": "Shared OpenRouter",
+                    "model": "shared/model"
+                },
+                {
+                    "provider": "nvidia",
+                    "name": "Shared NVIDIA",
+                    "model": "shared/model"
+                }
+            ]
+        }"#;
+
+        let models = parse_third_party_models_from_str(raw);
+        let model_map = models
+            .iter()
+            .cloned()
+            .map(|model| (model.id.clone(), model))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(models.len(), 2);
+        assert!(model_map.contains_key("openrouter:shared/model"));
+        assert!(model_map.contains_key("nvidia:shared/model"));
+        assert_eq!(
+            resolve_exact_model_identifier("shared/model", &models, None),
+            "shared/model"
+        );
+    }
+
+    #[test]
+    fn resolve_model_by_keyword_returns_provider_qualified_id() {
+        let models = vec![
+            build_third_party_model_config(
+                ThirdPartyProvider::OpenRouter,
+                "Llama 4",
+                "meta-llama/llama-4",
+                true,
+                false,
+                false,
+                true,
+            ),
+            build_third_party_model_config(
+                ThirdPartyProvider::Nvidia,
+                "Nemotron Super 49B",
+                "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+                false,
+                false,
+                false,
+                true,
+            ),
+        ];
+
+        let resolved = resolve_model_by_keyword(
+            "",
+            &models,
+            &["nemotron"],
+            Some(ThirdPartyProvider::OpenRouter),
+        );
+        assert_eq!(resolved, "nvidia:nvidia/llama-3.3-nemotron-super-49b-v1.5");
+
+        let legacy_exact = resolve_model_by_keyword(
+            "meta-llama/llama-4",
+            &models,
+            &["llama"],
+            Some(ThirdPartyProvider::OpenRouter),
+        );
+        assert_eq!(legacy_exact, "openrouter:meta-llama/llama-4");
+    }
+
+    #[test]
+    fn legacy_openrouter_models_are_used_when_json_is_missing() {
+        let path = std::env::temp_dir().join(format!(
+            "missing-third-party-models-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let legacy_env = LegacyOpenRouterEnv {
+            llama_model: "meta-llama/llama-4".to_string(),
+            grok_model: String::new(),
+            qwen_model: String::new(),
+            deepseek_model: String::new(),
+            gpt_model: String::new(),
+        };
+
+        let models = build_third_party_models(&path, &legacy_env);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider, ThirdPartyProvider::OpenRouter);
+        assert_eq!(models[0].id, "openrouter:meta-llama/llama-4");
+    }
+}
 
 pub const PORTRAIT_SYSTEM_PROMPT: &str = r#"You are a Master Character Designer and Cinematic Portrait Photographer specializing in "Nano Banana Pro" prompts.
 

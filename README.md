@@ -5,7 +5,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 ## What it does
 - Stores chat history in SQLite for summaries and profiling.
 - Provides group-friendly commands for summaries, fact checks, Q and A, and media generation.
-- Uses Gemini by default with optional OpenRouter and search integrations.
+- Uses Gemini by default with optional third-party hosted models (OpenRouter and NVIDIA) plus search integrations.
 - Extracts content from Telegraph and Twitter links and can upload images to CWD.PW.
 - Writes text logs to `logs/bot.log` and `logs/timing.log`.
 - Writes structured JSON logs to `logs/bot.jsonl` and `logs/timing.jsonl`.
@@ -13,7 +13,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 ## Commands
 - `/tldr` - Summarize recent chat history in the thread.
 - `/factcheck` - Fact-check a statement (text or reply).
-- `/q` - Ask a question (uses model selection when OpenRouter models are configured).
+- `/q` - Ask a question (uses model selection when third-party models are configured).
 - Mentioning the bot (for example `@YourBot question`) or replying to this bot's message also triggers `/q` behavior automatically.
 - `/qq` - Quick Gemini response using the default Gemini model.
 - `/img` - Generate or edit an image with Gemini.
@@ -31,7 +31,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `src/main.rs` - Bot entry point and dispatcher wiring.
 - `src/config.rs` - Environment loading and defaults.
 - `src/handlers/` - Command handlers, access control, and response logic.
-- `src/llm/` - Gemini and OpenRouter clients, tool orchestration, media helpers.
+- `src/llm/` - Gemini and third-party model clients, tool orchestration, media helpers.
 - `src/db/` - SQLite access and background writer queue.
 - `src/utils/` - Logging, timing, and HTTP helpers.
 
@@ -103,6 +103,10 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `GEMINI_SAFETY_SETTINGS` - Safety profile: `standard` or `permissive` (`off`/`none` are treated as `permissive`). Default: `permissive`.
   - `standard` maps to `BLOCK_MEDIUM_AND_ABOVE`; `permissive` maps to `OFF` for all Gemini safety categories.
 
+### Shared third-party model catalog
+- `THIRD_PARTY_MODELS_CONFIG_PATH` - Path to the mixed-provider model config JSON.
+  - Defaults to `third_party_models.json` or `bot/third_party_models.json` if present.
+
 ### OpenRouter (optional)
 - `ENABLE_OPENROUTER` - Enable OpenRouter. Default: `true`.
 - `OPENROUTER_API_KEY` - OpenRouter API key.
@@ -111,8 +115,15 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENROUTER_TEMPERATURE` - Default: `0.7`.
 - `OPENROUTER_TOP_K` - Default: `40`.
 - `OPENROUTER_TOP_P` - Default: `0.95`.
-- `OPENROUTER_MODELS_CONFIG_PATH` - Path to model config JSON.
-  - Defaults to `openrouter_models.json` or `bot/openrouter_models.json` if present.
+
+### NVIDIA hosted models (optional)
+- `ENABLE_NVIDIA` - Enable NVIDIA-hosted chat models. Default: `true`.
+- `NVIDIA_API_KEY` - NVIDIA API key for `integrate.api.nvidia.com`.
+- `NVIDIA_BASE_URL` - Default: `https://integrate.api.nvidia.com/v1`.
+- `NVIDIA_TEMPERATURE` - Default: `0.7`.
+- `NVIDIA_TOP_K` - Stored for config symmetry; not sent to hosted NVIDIA chat requests unless NVIDIA documents support.
+- `NVIDIA_TOP_P` - Default: `0.95`.
+- NVIDIA hosted chat completions are integrated through their OpenAI-compatible endpoint.
 
 Legacy OpenRouter model variables (used if JSON is missing):
 - `LLAMA_MODEL`
@@ -121,17 +132,27 @@ Legacy OpenRouter model variables (used if JSON is missing):
 - `DEEPSEEK_MODEL`
 - `GPT_MODEL`
 
-Example `openrouter_models.json`:
+Example `third_party_models.json`:
 ```json
 {
   "models": [
     {
+      "provider": "openrouter",
       "name": "Llama 4",
       "model": "meta-llama/llama-4",
       "image": true,
       "video": false,
       "audio": false,
       "tools": true
+    },
+    {
+      "provider": "nvidia",
+      "name": "Gemma 3n",
+      "model": "google/gemma-3n-e4b-it",
+      "image": true,
+      "video": false,
+      "audio": true,
+      "tools": false
     }
   ]
 }

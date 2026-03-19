@@ -160,6 +160,7 @@ fn redact_sensitive_text(text: &str) -> String {
         CONFIG.bot_token.as_str(),
         CONFIG.gemini_api_key.as_str(),
         CONFIG.openrouter_api_key.as_str(),
+        CONFIG.nvidia_api_key.as_str(),
         CONFIG.jina_ai_api_key.as_str(),
         CONFIG.brave_search_api_key.as_str(),
         CONFIG.exa_api_key.as_str(),
@@ -213,7 +214,8 @@ async fn build_status_report(state: &AppState) -> String {
     let brave_ready = CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty();
     let exa_ready = CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty();
     let jina_ready = CONFIG.enable_jina_mcp;
-    let openrouter_ready = CONFIG.enable_openrouter && !CONFIG.openrouter_api_key.trim().is_empty();
+    let openrouter_ready = CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenRouter);
+    let nvidia_ready = CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::Nvidia);
 
     let whitelist_path = Path::new(&CONFIG.whitelist_file_path);
     let whitelist_ready = whitelist_path.exists();
@@ -237,6 +239,15 @@ async fn build_status_report(state: &AppState) -> String {
     report.push_str(&format!(
         "openrouter_ready: {}\n",
         bool_label(openrouter_ready)
+    ));
+    report.push_str(&format!("nvidia_ready: {}\n", bool_label(nvidia_ready)));
+    report.push_str(&format!(
+        "third_party_models_config_path: {}\n",
+        CONFIG.third_party_models_config_path.display()
+    ));
+    report.push_str(&format!(
+        "third_party_models_count: {}\n",
+        CONFIG.iter_third_party_models().len()
     ));
     report.push_str(&format!(
         "web_search_enabled: {}\n",
@@ -278,6 +289,10 @@ async fn build_diagnose_report(state: &AppState) -> String {
     report.push_str(&format!(
         "OPENROUTER_API_KEY_present: {}\n",
         bool_label(!CONFIG.openrouter_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "NVIDIA_API_KEY_present: {}\n",
+        bool_label(!CONFIG.nvidia_api_key.trim().is_empty())
     ));
     report.push_str(&format!(
         "JINA_AI_API_KEY_present: {}\n",
