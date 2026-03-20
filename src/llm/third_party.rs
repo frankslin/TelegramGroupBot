@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use regex::Regex;
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
@@ -12,7 +13,11 @@ use crate::utils::http::get_http_client;
 use crate::utils::timing::log_llm_timing;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
+const THIRD_PARTY_MAX_ATTEMPTS: usize = 3;
+const THIRD_PARTY_RETRY_BASE_DELAY_MS: u64 = 900;
+const THIRD_PARTY_REQUEST_TIMEOUT_SECS: u64 = 60;
 const TOOL_LIMIT_SYSTEM_PROMPT: &str = "Tool call limit reached. Provide the best possible answer using the available information without requesting more tool calls.";
+const THIRD_PARTY_TOOL_LIMIT_GUIDANCE: &str = "Third-party tool usage limit: you may use tools for at most {max_tool_calls} rounds total in this conversation. Plan your searches efficiently, avoid redundant tool calls, and after the final allowed tool round you must answer using the information already gathered without requesting more tool calls.";
 const OPENROUTER_REFERER: &str = "https://github.com/sailself/TelegramGroupHelperBot";
 const OPENROUTER_TITLE: &str = "TelegramGroupHelperBot";
 
@@ -103,6 +108,34 @@ fn summarize_error_body(body: &str) -> (Option<String>, String) {
     }
 
     (None, truncate_for_log(trimmed, 2000))
+}
+
+fn third_party_should_retry_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
+}
+
+fn third_party_should_retry_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+}
+
+fn third_party_retry_delay(attempt: usize) -> Duration {
+    let attempt = attempt.max(1) as u64;
+    Duration::from_millis(THIRD_PARTY_RETRY_BASE_DELAY_MS.saturating_mul(attempt))
+}
+
+fn build_third_party_system_prompt(
+    system_prompt: &str,
+    include_tool_limit_guidance: bool,
+) -> String {
+    if !include_tool_limit_guidance {
+        return system_prompt.to_string();
+    }
+
+    let tool_limit_guidance = THIRD_PARTY_TOOL_LIMIT_GUIDANCE
+        .replace("{max_tool_calls}", &MAX_TOOL_CALL_ITERATIONS.to_string());
+    format!("{system_prompt}\n\n{tool_limit_guidance}")
 }
 
 fn parse_gpt_content(content: &str) -> String {
@@ -312,7 +345,10 @@ fn build_request_details_for_runtime(
 
     ProviderRequestDetails {
         display_name: runtime.display_name,
-        url: format!("{}/chat/completions", runtime.base_url.trim_end_matches('/')),
+        url: format!(
+            "{}/chat/completions",
+            runtime.base_url.trim_end_matches('/')
+        ),
         headers,
         payload,
     }
@@ -342,40 +378,134 @@ async fn call_provider_api(details: &ProviderRequestDetails) -> Result<Value> {
     );
 
     let client = get_http_client();
-    let mut request = client.post(&details.url).timeout(Duration::from_secs(60));
-    for (name, value) in &details.headers {
-        request = request.header(name, value);
-    }
-    let response = request.json(&details.payload).send().await?;
+    for attempt in 1..=THIRD_PARTY_MAX_ATTEMPTS {
+        let mut request = client
+            .post(&details.url)
+            .timeout(Duration::from_secs(THIRD_PARTY_REQUEST_TIMEOUT_SECS));
+        for (name, value) in &details.headers {
+            request = request.header(name, value);
+        }
+        let response = match request.json(&details.payload).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                let should_retry =
+                    third_party_should_retry_error(&err) && attempt < THIRD_PARTY_MAX_ATTEMPTS;
+                warn!(
+                    "{} request failed to send: {} (timeout={}, connect={}, status={:?}, attempt={}/{}, retrying={})",
+                    details.display_name,
+                    err,
+                    err.is_timeout(),
+                    err.is_connect(),
+                    err.status(),
+                    attempt,
+                    THIRD_PARTY_MAX_ATTEMPTS,
+                    should_retry
+                );
+                if should_retry {
+                    tokio::time::sleep(third_party_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(anyhow!("{} request failed: {}", details.display_name, err));
+            }
+        };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let (message, body_summary) = summarize_error_body(&body);
-        warn!(
-            "{} API error: status={}, body={}",
-            details.display_name, status, body_summary
-        );
-        let detail = message.unwrap_or(body_summary);
-        return Err(anyhow!(
-            "{} request failed with status {}: {}",
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let (message, body_summary) = summarize_error_body(&body);
+            let should_retry =
+                third_party_should_retry_status(status) && attempt < THIRD_PARTY_MAX_ATTEMPTS;
+            warn!(
+                "{} API error: status={}, body={}, attempt={}/{}, retrying={}",
+                details.display_name,
+                status,
+                body_summary,
+                attempt,
+                THIRD_PARTY_MAX_ATTEMPTS,
+                should_retry
+            );
+            if should_retry {
+                tokio::time::sleep(third_party_retry_delay(attempt)).await;
+                continue;
+            }
+            let detail = message.unwrap_or(body_summary);
+            return Err(anyhow!(
+                "{} request failed with status {}: {}",
+                details.display_name,
+                status,
+                detail
+            ));
+        }
+
+        let value = response.json::<Value>().await?;
+        debug!(
+            "{} response received for model={}",
             details.display_name,
-            status,
-            detail
-        ));
+            details
+                .payload
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+        );
+        return Ok(value);
     }
 
-    let value = response.json::<Value>().await?;
+    unreachable!("third-party provider retry loop exhausted")
+}
+
+fn extract_response_message(response: &Value) -> Value {
+    response
+        .get("choices")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn extract_tool_calls(message: &Value) -> Vec<Value> {
+    message
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn request_final_answer_after_tool_limit(
+    mut messages: Vec<Value>,
+    model_config: &ThirdPartyModelConfig,
+) -> Result<String> {
+    messages.push(json!({
+        "role": "system",
+        "content": TOOL_LIMIT_SYSTEM_PROMPT
+    }));
+
     debug!(
-        "{} response received for model={}",
-        details.display_name,
-        details
-            .payload
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
+        "{} tool limit reached; requesting final answer without tools",
+        model_config.provider.as_str()
     );
-    Ok(value)
+
+    let details = build_request_details(model_config, messages, None, None)?;
+    let response = call_provider_api(&details).await?;
+    let message = extract_response_message(&response);
+    let tool_calls = extract_tool_calls(&message);
+    if !tool_calls.is_empty() {
+        warn!(
+            "{} returned {} unexpected tool call(s) after tool limit; ignoring them and using available content",
+            details.display_name,
+            tool_calls.len()
+        );
+    }
+
+    let content = extract_message_content(&message);
+    if content.trim().is_empty() {
+        warn!(
+            "{} final response after tool limit had empty content: {}",
+            details.display_name,
+            truncate_for_log(&response.to_string(), 2000)
+        );
+    }
+
+    Ok(parse_third_party_response(model_config, &content))
 }
 
 async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> {
@@ -409,7 +539,10 @@ async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> 
     }
 }
 
-async fn chat_completion_with_tools(mut messages: Vec<Value>, model_config: &ThirdPartyModelConfig) -> Result<String> {
+async fn chat_completion_with_tools(
+    mut messages: Vec<Value>,
+    model_config: &ThirdPartyModelConfig,
+) -> Result<String> {
     let tools = build_function_tools();
 
     for iteration in 0..MAX_TOOL_CALL_ITERATIONS {
@@ -426,19 +559,10 @@ async fn chat_completion_with_tools(mut messages: Vec<Value>, model_config: &Thi
             Some("auto"),
         )?;
         let response = call_provider_api(&details).await?;
-        let message = response
-            .get("choices")
-            .and_then(|v| v.get(0))
-            .and_then(|v| v.get("message"))
-            .cloned()
-            .unwrap_or(Value::Null);
+        let message = extract_response_message(&response);
 
         let content = extract_message_content(&message);
-        let tool_calls = message
-            .get("tool_calls")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let tool_calls = extract_tool_calls(&message);
 
         if tool_calls.is_empty() {
             if content.trim().is_empty() {
@@ -480,14 +604,11 @@ async fn chat_completion_with_tools(mut messages: Vec<Value>, model_config: &Thi
         }
 
         if iteration + 1 == MAX_TOOL_CALL_ITERATIONS {
-            messages.push(json!({
-                "role": "system",
-                "content": TOOL_LIMIT_SYSTEM_PROMPT
-            }));
+            return request_final_answer_after_tool_limit(messages, model_config).await;
         }
     }
 
-    Ok("".to_string())
+    unreachable!("third-party tool loop exhausted without returning")
 }
 
 pub async fn call_third_party(
@@ -506,6 +627,8 @@ pub async fn call_third_party(
         .get_third_party_model_config(model_id)
         .cloned()
         .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))?;
+    let tools_enabled = supports_tools && web_search::is_search_enabled();
+    let system_prompt = build_third_party_system_prompt(system_prompt, tools_enabled);
     let message_content = build_message_content(user_content, image_data_list);
 
     let messages = vec![
@@ -515,13 +638,17 @@ pub async fn call_third_party(
 
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
 
-    if supports_tools && web_search::is_search_enabled() {
+    if tools_enabled {
         return log_llm_timing(
             model_config.provider.as_str(),
             &model_config.id,
             &operation,
             None,
-            || async { chat_completion_with_tools(messages, &model_config).await.map_err(|err| anyhow!(err)) },
+            || async {
+                chat_completion_with_tools(messages, &model_config)
+                    .await
+                    .map_err(|err| anyhow!(err))
+            },
         )
         .await;
     }
@@ -542,8 +669,9 @@ pub async fn call_third_party(
                 .map(extract_message_content)
                 .unwrap_or_default();
             Ok(parse_third_party_response(&model_config, &content))
-        })
-        .await;
+        },
+    )
+    .await;
     result
 }
 
@@ -576,30 +704,30 @@ mod tests {
             top_k: Some(40),
         };
         let details = build_request_details_for_runtime(
-            &model(ThirdPartyProvider::OpenRouter, "Qwen 3", "qwen/qwen3-next-80b-a3b-instruct:free"),
+            &model(
+                ThirdPartyProvider::OpenRouter,
+                "Qwen 3",
+                "qwen/qwen3-next-80b-a3b-instruct:free",
+            ),
             &runtime,
             vec![json!({ "role": "user", "content": "hello" })],
             None,
             None,
         );
 
+        assert_eq!(details.url, "https://openrouter.ai/api/v1/chat/completions");
+        assert!(details
+            .headers
+            .iter()
+            .any(|(name, value)| name == "HTTP-Referer" && value == OPENROUTER_REFERER));
+        assert!(details
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Title" && value == OPENROUTER_TITLE));
         assert_eq!(
-            details.url,
-            "https://openrouter.ai/api/v1/chat/completions"
+            details.payload.get("top_k").and_then(|v| v.as_i64()),
+            Some(40)
         );
-        assert!(
-            details
-                .headers
-                .iter()
-                .any(|(name, value)| name == "HTTP-Referer" && value == OPENROUTER_REFERER)
-        );
-        assert!(
-            details
-                .headers
-                .iter()
-                .any(|(name, value)| name == "X-Title" && value == OPENROUTER_TITLE)
-        );
-        assert_eq!(details.payload.get("top_k").and_then(|v| v.as_i64()), Some(40));
     }
 
     #[test]
@@ -614,7 +742,11 @@ mod tests {
             top_k: None,
         };
         let details = build_request_details_for_runtime(
-            &model(ThirdPartyProvider::Nvidia, "Gemma 3n", "google/gemma-3n-e4b-it"),
+            &model(
+                ThirdPartyProvider::Nvidia,
+                "Gemma 3n",
+                "google/gemma-3n-e4b-it",
+            ),
             &runtime,
             vec![json!({ "role": "user", "content": "hello" })],
             None,
@@ -625,12 +757,48 @@ mod tests {
             details.url,
             "https://integrate.api.nvidia.com/v1/chat/completions"
         );
-        assert!(
-            !details
-                .headers
-                .iter()
-                .any(|(name, _)| name == "HTTP-Referer" || name == "X-Title")
-        );
+        assert!(!details
+            .headers
+            .iter()
+            .any(|(name, _)| name == "HTTP-Referer" || name == "X-Title"));
         assert!(details.payload.get("top_k").is_none());
+    }
+
+    #[test]
+    fn retryable_statuses_match_expected_provider_failures() {
+        assert!(third_party_should_retry_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(third_party_should_retry_status(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(third_party_should_retry_status(StatusCode::BAD_GATEWAY));
+        assert!(third_party_should_retry_status(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!third_party_should_retry_status(StatusCode::BAD_REQUEST));
+        assert!(!third_party_should_retry_status(StatusCode::UNAUTHORIZED));
+        assert!(!third_party_should_retry_status(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn retry_delay_grows_by_attempt() {
+        assert_eq!(third_party_retry_delay(1), Duration::from_millis(900));
+        assert_eq!(third_party_retry_delay(2), Duration::from_millis(1800));
+        assert_eq!(third_party_retry_delay(3), Duration::from_millis(2700));
+    }
+
+    #[test]
+    fn system_prompt_includes_tool_limit_guidance_when_enabled() {
+        let prompt = build_third_party_system_prompt("Base prompt", true);
+        assert!(prompt.starts_with("Base prompt"));
+        assert!(prompt.contains("at most 3 rounds total"));
+        assert!(prompt.contains("without requesting more tool calls"));
+    }
+
+    #[test]
+    fn system_prompt_is_unchanged_when_tool_limit_guidance_disabled() {
+        assert_eq!(
+            build_third_party_system_prompt("Base prompt", false),
+            "Base prompt"
+        );
     }
 }
