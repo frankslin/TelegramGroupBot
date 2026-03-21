@@ -4,7 +4,7 @@ use dotenvy::dotenv;
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod config;
 mod db;
@@ -24,26 +24,75 @@ use utils::logging::init_logging;
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 enum Command {
+    #[command(description = "介绍AI小喵和可用指令")]
     Start,
+    #[command(description = "查看帮助与指令说明")]
     Help,
+    #[command(description = "汇总最近 N 条消息（默认 100 条，可用 /tldr 50 指定数量）")]
     Tldr(String),
+    #[command(
+        description = "回复一条文字/图片/视频/音频消息进行事实核查，支持消息内的 Telegraph/Twitter/YouTube 链接"
+    )]
     Factcheck(String),
+    #[command(
+        description = "提问或分析媒体，弹出模型选择（默认 Gemini，自动隐藏不支持当前媒体的模型）"
+    )]
     Q(String),
+    #[command(description = "询问本群聊里的历史内容，可检索当前聊天记录并在需要时联网搜索")]
     Qc(String),
+    #[command(
+        description = "Quick Question（快问快答），小喵会用Gemini的低思考级别尽量快捷地回答你的问题"
+    )]
     Qq(String),
+    #[command(description = "搜索本群聊相关消息，返回命中的消息摘要和直达链接")]
     S(String),
+    #[command(
+        description = "用 Gemini（或已配置的 Vertex）生成/编辑图片，可直接描述或回复图片/贴纸"
+    )]
     Img(String),
+    #[command(description = "与 /img 相同，但附带分辨率与长宽比按钮")]
     Image(String),
+    #[command(description = "用 Veo 生成视频")]
     Vid(String),
+    #[command(description = "基于你在本群的聊天记录生成个人简介")]
     Profileme(String),
+    #[command(description = "基于你在本群的聊天记录生成艺术形象")]
     Paintme,
+    #[command(description = "基于你在本群的聊天记录生成肖像")]
     Portraitme,
+    #[command(description = "查看机器人状态（管理员）")]
     Status,
+    #[command(description = "查看诊断信息（管理员）")]
     Diagnose,
+    #[command(description = "投喂AI小喵")]
     Support,
 }
 
 type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
+
+fn public_bot_commands() -> Vec<teloxide::types::BotCommand> {
+    const PUBLIC_COMMAND_NAMES: &[&str] = &[
+        "start",
+        "help",
+        "tldr",
+        "factcheck",
+        "q",
+        "qc",
+        "qq",
+        "s",
+        "img",
+        "image",
+        "profileme",
+        "paintme",
+        "portraitme",
+        "support",
+    ];
+
+    Command::bot_commands()
+        .into_iter()
+        .filter(|command| PUBLIC_COMMAND_NAMES.contains(&command.command.as_str()))
+        .collect()
+}
 
 #[tokio::main]
 async fn main() -> HandlerResult {
@@ -64,6 +113,9 @@ async fn main() -> HandlerResult {
     let state = AppState::new(db, bot_user_id, bot_username_lower);
 
     handlers::access::load_whitelist();
+    if let Err(err) = bot.set_my_commands(public_bot_commands()).await {
+        warn!("Failed to publish bot command descriptions: {err}");
+    }
 
     let command_handler = dptree::entry()
         .filter_command::<Command>()
