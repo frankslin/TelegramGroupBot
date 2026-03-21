@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
+use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::get_http_client;
 use crate::utils::timing::log_llm_timing;
@@ -609,6 +610,116 @@ async fn chat_completion_with_tools(
     }
 
     unreachable!("third-party tool loop exhausted without returning")
+}
+
+async fn chat_completion_with_tool_runtime(
+    mut messages: Vec<Value>,
+    model_config: &ThirdPartyModelConfig,
+    runtime: &mut ToolRuntime,
+) -> Result<String> {
+    let tools = runtime.build_openai_function_tools();
+    let mut tools_enabled = !tools.is_empty();
+    let mut final_answer_requested = false;
+
+    for _ in 0..runtime.max_total_successful_calls().saturating_add(2) {
+        let details = build_request_details(
+            model_config,
+            messages.clone(),
+            tools_enabled.then_some(tools.clone()),
+            Some("auto"),
+        )?;
+        let response = call_provider_api(&details).await?;
+        let message = extract_response_message(&response);
+        let content = extract_message_content(&message);
+        let tool_calls = if tools_enabled {
+            extract_tool_calls(&message)
+        } else {
+            Vec::new()
+        };
+
+        if tool_calls.is_empty() {
+            if content.trim().is_empty() {
+                warn!(
+                    "{} custom-tool response had empty content and no tool calls: {}",
+                    details.display_name,
+                    truncate_for_log(&response.to_string(), 2000)
+                );
+            }
+            return Ok(parse_third_party_response(model_config, &content));
+        }
+
+        messages.push(message.clone());
+
+        for tool_call in tool_calls {
+            let tool_name = tool_call
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args_text = tool_call
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            let args_value: Value = serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
+            let result = runtime.execute_tool(tool_name, &args_value).await;
+
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_call.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                "content": result,
+            }));
+        }
+
+        if runtime.force_final_answer() && !final_answer_requested {
+            messages.push(json!({
+                "role": "system",
+                "content": TOOL_LIMIT_SYSTEM_PROMPT,
+            }));
+            final_answer_requested = true;
+            tools_enabled = false;
+        }
+    }
+
+    request_final_answer_after_tool_limit(messages, model_config).await
+}
+
+pub async fn call_third_party_with_tool_runtime(
+    system_prompt: &str,
+    user_content: &str,
+    model_id: &str,
+    response_title: &str,
+    image_data_list: &[Vec<u8>],
+    runtime: &mut ToolRuntime,
+) -> Result<String> {
+    if model_id.trim().is_empty() {
+        return Err(anyhow!("Model identifier is required"));
+    }
+
+    let model_config = CONFIG
+        .get_third_party_model_config(model_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))?;
+    let system_prompt = format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance());
+    let message_content = build_message_content(user_content, image_data_list);
+    let messages = vec![
+        json!({ "role": "system", "content": system_prompt }),
+        json!({ "role": "user", "content": message_content }),
+    ];
+    let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
+
+    log_llm_timing(
+        model_config.provider.as_str(),
+        &model_config.id,
+        &operation,
+        None,
+        || async {
+            chat_completion_with_tool_runtime(messages, &model_config, runtime)
+                .await
+                .map_err(|err| anyhow!(err))
+        },
+    )
+    .await
 }
 
 pub async fn call_third_party(

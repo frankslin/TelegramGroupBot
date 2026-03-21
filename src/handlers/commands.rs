@@ -214,8 +214,10 @@ async fn build_status_report(state: &AppState) -> String {
     let brave_ready = CONFIG.enable_brave_search && !CONFIG.brave_search_api_key.trim().is_empty();
     let exa_ready = CONFIG.enable_exa_search && !CONFIG.exa_api_key.trim().is_empty();
     let jina_ready = CONFIG.enable_jina_mcp;
-    let openrouter_ready = CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenRouter);
-    let nvidia_ready = CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::Nvidia);
+    let openrouter_ready =
+        CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenRouter);
+    let nvidia_ready =
+        CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::Nvidia);
 
     let whitelist_path = Path::new(&CONFIG.whitelist_file_path);
     let whitelist_ready = whitelist_path.exists();
@@ -1850,8 +1852,14 @@ Usage: `/factcheck [statement]` or reply to a message with `/factcheck`
 /q - Ask a question
 Usage: `/q [your question]`
 
+/qc - Ask a question about this chat using same-chat retrieval
+Usage: `/qc [your question]`
+
 /qq - Quick Gemini answer using the default Gemini model
 Usage: `/qq [your quick question]`
+
+/s - Search this chat and return relevant message links
+Usage: `/s [search query]`
 
 /img - Generate or edit an image using Gemini
 Usage: `/img [description]` for generating a new image

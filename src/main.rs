@@ -29,7 +29,9 @@ enum Command {
     Tldr(String),
     Factcheck(String),
     Q(String),
+    Qc(String),
     Qq(String),
+    S(String),
     Img(String),
     Image(String),
     Vid(String),
@@ -150,6 +152,17 @@ async fn handle_command(
                 }
             });
         }
+        Command::Qc(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) = qa::qc_handler(bot, state, message, arg).await {
+                    error!("qc handler failed: {err}");
+                }
+            });
+        }
         Command::Qq(arg) => {
             let bot = bot.clone();
             let state = state.clone();
@@ -158,6 +171,17 @@ async fn handle_command(
             tokio::spawn(async move {
                 if let Err(err) = qa::qq_handler(bot, state, message, arg).await {
                     error!("qq handler failed: {err}");
+                }
+            });
+        }
+        Command::S(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) = qa::s_handler(bot, state, message, arg).await {
+                    error!("s handler failed: {err}");
                 }
             });
         }

@@ -26,3 +26,18 @@ pub struct MessageInsert {
     pub date: DateTime<Utc>,
     pub reply_to_message_id: Option<i64>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSearchHit {
+    pub message_id: i64,
+    pub chat_id: i64,
+    pub user_id: Option<i64>,
+    pub username: Option<String>,
+    pub text: String,
+    pub language: Option<String>,
+    pub date: DateTime<Utc>,
+    pub reply_to_message_id: Option<i64>,
+    pub snippet: String,
+    pub link: Option<String>,
+    pub score: f64,
+}

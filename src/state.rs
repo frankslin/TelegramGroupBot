@@ -8,6 +8,18 @@ use crate::db::database::Database;
 use crate::llm::media::MediaFile;
 use crate::utils::timing::CommandTimer;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QaCommandMode {
+    Standard,
+    ChatContext,
+}
+
+impl QaCommandMode {
+    pub fn requires_custom_tools(self) -> bool {
+        matches!(self, Self::ChatContext)
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct PendingQRequest {
@@ -28,6 +40,7 @@ pub struct PendingQRequest {
     pub reply_to_message_id: Option<i64>,
     pub timestamp: i64,
     pub command_timer: Option<CommandTimer>,
+    pub mode: QaCommandMode,
 }
 
 #[allow(dead_code)]

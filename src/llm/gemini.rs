@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::CONFIG;
 use crate::llm::media::{detect_mime_type, download_media, kind_for_mime, MediaFile, MediaKind};
+use crate::llm::tool_runtime::ToolRuntime;
 use crate::utils::http::get_http_client;
 use crate::utils::timing::log_llm_timing;
 
@@ -797,6 +798,17 @@ async fn call_gemini_api(
     payload: serde_json::Value,
     system_prompt_label: Option<&str>,
 ) -> Result<GeminiResponse> {
+    let value = call_gemini_api_value(model, payload, system_prompt_label).await?;
+    let parsed = serde_json::from_value::<GeminiResponse>(value)
+        .map_err(|err| anyhow!("Gemini generateContent response decode failed: {}", err))?;
+    Ok(parsed)
+}
+
+async fn call_gemini_api_value(
+    model: &str,
+    payload: serde_json::Value,
+    system_prompt_label: Option<&str>,
+) -> Result<Value> {
     let client = get_http_client();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
@@ -870,14 +882,242 @@ async fn call_gemini_api(
             ));
         }
 
-        let value =
-            decode_json_response::<GeminiResponse>(response, "Gemini generateContent").await?;
+        let value = decode_json_response::<Value>(response, "Gemini generateContent").await?;
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let response_summary = summarize_gemini_response(&value);
+            let parsed = serde_json::from_value::<GeminiResponse>(value.clone()).ok();
+            let response_summary = parsed
+                .as_ref()
+                .map(summarize_gemini_response)
+                .unwrap_or_else(|| {
+                    json!({
+                        "rawResponsePreview": truncate_for_log(&value.to_string(), 400)
+                    })
+                });
             debug!(target: "llm.gemini", model = model, response = %response_summary);
         }
         return Ok(value);
     }
+}
+
+fn extract_text_from_response_value(response: &Value) -> String {
+    let mut text_parts = Vec::new();
+    let mut fallback_parts = Vec::new();
+    let candidates = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for candidate in candidates {
+        let parts = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    text_parts.push(text.to_string());
+                }
+            } else if let Some(code) = part
+                .get("executableCode")
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str)
+            {
+                if !code.trim().is_empty() {
+                    fallback_parts.push(code.to_string());
+                }
+            } else if let Some(output) = part
+                .get("codeExecutionResult")
+                .and_then(|value| value.get("output"))
+                .and_then(Value::as_str)
+            {
+                if !output.trim().is_empty() {
+                    fallback_parts.push(output.to_string());
+                }
+            }
+        }
+    }
+
+    if text_parts.is_empty() {
+        fallback_parts.join("\n")
+    } else {
+        text_parts.join("\n")
+    }
+}
+
+fn extract_candidate_content(response: &Value) -> Option<Value> {
+    response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("content"))
+        .cloned()
+}
+
+fn extract_function_calls(content: &Value) -> Vec<Value> {
+    content
+        .get("parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("functionCall").cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn base_generation_config() -> Value {
+    json!({
+        "temperature": CONFIG.gemini_temperature,
+        "topK": CONFIG.gemini_top_k,
+        "topP": CONFIG.gemini_top_p,
+        "maxOutputTokens": CONFIG.gemini_max_output_tokens,
+    })
+}
+
+fn with_response_json_schema(config: Value, response_json_schema: Option<&Value>) -> Value {
+    let Some(schema) = response_json_schema else {
+        return config;
+    };
+
+    let mut config_object = config.as_object().cloned().unwrap_or_default();
+    config_object.insert(
+        "responseMimeType".to_string(),
+        Value::String("application/json".to_string()),
+    );
+    config_object.insert("responseJsonSchema".to_string(), schema.clone());
+    Value::Object(config_object)
+}
+
+fn build_function_response_part(function_call: &Value, result_json: &str) -> Value {
+    let name = function_call
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let id = function_call
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+    let response_value = serde_json::from_str::<Value>(result_json)
+        .unwrap_or_else(|_| json!({ "result": result_json }));
+
+    let mut function_response = json!({
+        "name": name,
+        "response": response_value,
+    });
+    if let Some(id) = id {
+        function_response["id"] = Value::String(id);
+    }
+
+    json!({ "functionResponse": function_response })
+}
+
+pub async fn call_gemini_with_tool_runtime(
+    system_prompt: &str,
+    user_content: &str,
+    runtime: &mut ToolRuntime,
+    use_pro_model: bool,
+    media_files: Option<Vec<MediaFile>>,
+    youtube_urls: Option<Vec<String>>,
+    system_prompt_label: Option<&str>,
+    final_response_json_schema: Option<Value>,
+) -> Result<GeminiCallResult> {
+    let content = user_content.to_string();
+    let youtube_urls = youtube_urls.unwrap_or_default();
+    let files = media_files.unwrap_or_default();
+    let uploaded_files = if files.is_empty() {
+        Vec::new()
+    } else {
+        upload_media_files(&files).await?
+    };
+    let text_after_media = !uploaded_files.is_empty() || !youtube_urls.is_empty();
+    let parts = build_gemini_file_parts(&content, &uploaded_files, &youtube_urls, text_after_media);
+    let mut contents = vec![json!({ "role": "user", "parts": parts })];
+
+    let model = if use_pro_model {
+        CONFIG.gemini_pro_model.as_str()
+    } else {
+        CONFIG.gemini_model.as_str()
+    };
+    let tool_limit_turns = runtime.max_total_successful_calls().saturating_add(2);
+    let mut tools_enabled = true;
+
+    for _ in 0..tool_limit_turns {
+        let mut payload = json!({
+            "systemInstruction": { "parts": [{ "text": system_prompt }] },
+            "contents": contents.clone(),
+            "generationConfig": base_generation_config(),
+            "safetySettings": build_safety_settings(),
+        });
+        if tools_enabled {
+            payload["tools"] = Value::Array(runtime.build_gemini_tools());
+        }
+
+        let response = call_gemini_api_value(model, payload, system_prompt_label).await?;
+        let Some(content) = extract_candidate_content(&response) else {
+            return Err(anyhow!(
+                "Gemini tool response did not include candidate content"
+            ));
+        };
+        let function_calls = if tools_enabled {
+            extract_function_calls(&content)
+        } else {
+            Vec::new()
+        };
+
+        if function_calls.is_empty() {
+            if final_response_json_schema.is_none() {
+                return Ok(GeminiCallResult {
+                    text: extract_text_from_response_value(&response),
+                    model_used: model.to_string(),
+                });
+            }
+            break;
+        }
+
+        contents.push(content);
+
+        let mut response_parts = Vec::new();
+        for function_call in function_calls {
+            let tool_name = function_call
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let args = function_call
+                .get("args")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let result_json = runtime.execute_tool(tool_name, &args).await;
+            response_parts.push(build_function_response_part(&function_call, &result_json));
+        }
+
+        contents.push(json!({
+            "role": "user",
+            "parts": response_parts,
+        }));
+
+        if runtime.force_final_answer() {
+            tools_enabled = false;
+        }
+    }
+
+    let final_payload = json!({
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "contents": contents.clone(),
+        "generationConfig": with_response_json_schema(
+            base_generation_config(),
+            final_response_json_schema.as_ref()
+        ),
+        "safetySettings": build_safety_settings(),
+    });
+    let final_response = call_gemini_api_value(model, final_payload, system_prompt_label).await?;
+    Ok(GeminiCallResult {
+        text: extract_text_from_response_value(&final_response),
+        model_used: model.to_string(),
+    })
 }
 
 async fn call_gemini_lite_fallback(

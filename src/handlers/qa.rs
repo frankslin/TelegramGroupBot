@@ -1,6 +1,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use serde::Deserialize;
+use serde_json::{json, Value};
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntityKind, MessageEntityRef,
@@ -9,8 +11,7 @@ use teloxide::types::{
 use teloxide::RequestError;
 
 use crate::config::{
-    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
-    Q_SYSTEM_PROMPT,
+    parse_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG, Q_SYSTEM_PROMPT,
 };
 use crate::db::database::build_message_insert;
 use crate::handlers::access::{check_access_control, is_rate_limited};
@@ -23,9 +24,13 @@ use crate::handlers::media::{
 };
 use crate::handlers::responses::send_response;
 use crate::llm::media::MediaKind;
-use crate::llm::{call_gemini, call_third_party};
-use crate::state::{AppState, PendingQRequest};
-use crate::utils::telegram::start_chat_action_heartbeat;
+use crate::llm::tool_runtime::ToolRuntime;
+use crate::llm::{
+    call_gemini, call_gemini_with_tool_runtime, call_third_party,
+    call_third_party_with_tool_runtime,
+};
+use crate::state::{AppState, PendingQRequest, QaCommandMode};
+use crate::utils::telegram::{build_message_link, start_chat_action_heartbeat};
 use crate::utils::timing::{complete_command_timer, start_command_timer};
 use tracing::warn;
 
@@ -33,6 +38,12 @@ pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 pub const MODEL_GEMINI: &str = "gemini";
 const SEND_MESSAGE_RETRY_ATTEMPTS: usize = 3;
 const USER_ERROR_DETAIL_LIMIT: usize = 400;
+const CHAT_SEARCH_RESULT_TARGET: usize = 15;
+const CHAT_SEARCH_MESSAGE_LIMIT: usize = 3500;
+
+const QC_SYSTEM_PROMPT: &str = "You are a helpful assistant in a Telegram group chat. You can use chat_context_query to retrieve messages from the current source chat only, and you must never assume access to any other chat. Use chat_context_query first when the user asks about prior discussion in this chat. Use web_search only for external or current facts that are not contained in the retrieved chat messages. Cite chat evidence with short snippets and the exact message link when chat history materially informs your answer. Cite web sources normally when web_search is used.\n\nGuidelines for your responses:\n1. Provide a direct, clear answer.\n2. Be concise but comprehensive.\n3. If you use retrieved chat messages, treat them as evidence from this chat only.\n4. If you use web search, cite the sources you relied on.\n5. IMPORTANT: The current UTC date and time is {current_datetime}.\n6. CRITICAL: You must decide the response language yourself using the same language policy as /q.\n7. Language policy:\n- Prefer the language of the user's actual question or request.\n- Ignore quoted text, links, usernames, slash commands, inline code, emojis, and other noise when deciding the response language.\n- If the replied-to content is in a different language from the user's current question, prioritize the current question unless the user explicitly asks you to answer in another language.\n- If the user's message is too short or ambiguous to infer reliably, use this Telegram user language hint: {telegram_user_language_hint}.\n- If that hint is missing, unknown, or still does not provide a reliable answer, default to Chinese.\n- When there is a clear instruction to answer in a specific language, follow that instruction.";
+
+const CHAT_SEARCH_SYSTEM_PROMPT: &str = "You are helping search the current Telegram chat only. The search tool is keyword-based FTS retrieval, not semantic search. You must iteratively use chat_context_query to search this chat, inspect the returned messages, keep only clearly relevant messages, reformulate the query if needed, and continue until you have 15 relevant unique message IDs or you exhaust the 5 allowed chat_context_query calls. Never fabricate message IDs. Only choose message IDs that the tool actually returned. If fewer than 15 clearly relevant messages exist, return the best verified subset and explain that fewer relevant messages were found.";
 
 fn now_unix_seconds() -> i64 {
     SystemTime::now()
@@ -397,11 +408,22 @@ fn is_third_party_model_available(config: &ThirdPartyModelConfig) -> bool {
     CONFIG.is_third_party_provider_ready(config.provider)
 }
 
-fn has_available_third_party_models() -> bool {
-    CONFIG
-        .iter_third_party_models()
-        .iter()
-        .any(is_third_party_model_available)
+fn has_available_third_party_models_for_request(
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> bool {
+    !available_third_party_models_for_request(
+        CONFIG.iter_third_party_models(),
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    )
+    .is_empty()
 }
 
 fn is_model_configured(model_key: &str) -> bool {
@@ -412,12 +434,32 @@ fn is_model_configured(model_key: &str) -> bool {
     CONFIG.get_third_party_model_config(&normalized).is_some()
 }
 
-fn model_supports_media(
+fn is_model_configured_for_request(
+    model_key: &str,
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> bool {
+    let normalized = normalize_model_identifier(model_key);
+    model_supports_media_for_request(
+        &normalized,
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    )
+}
+
+fn model_supports_media_for_request(
     model_name: &str,
     has_images: bool,
     has_video: bool,
     has_audio: bool,
     has_documents: bool,
+    require_tools: bool,
 ) -> bool {
     if model_name == MODEL_GEMINI {
         return true;
@@ -432,6 +474,30 @@ fn model_supports_media(
     if !is_third_party_model_available(config) {
         return false;
     }
+    third_party_model_matches_request_capabilities(
+        config,
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    )
+}
+
+fn third_party_model_matches_request_capabilities(
+    config: &ThirdPartyModelConfig,
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> bool {
+    if has_documents {
+        return false;
+    }
+    if require_tools && !config.tools {
+        return false;
+    }
     if has_images && !config.image {
         return false;
     }
@@ -444,11 +510,36 @@ fn model_supports_media(
     true
 }
 
+fn available_third_party_models_for_request<'a>(
+    models: &'a [ThirdPartyModelConfig],
+    has_images: bool,
+    has_video: bool,
+    has_audio: bool,
+    has_documents: bool,
+    require_tools: bool,
+) -> Vec<&'a ThirdPartyModelConfig> {
+    models
+        .iter()
+        .filter(|config| is_third_party_model_available(config))
+        .filter(|config| {
+            third_party_model_matches_request_capabilities(
+                config,
+                has_images,
+                has_video,
+                has_audio,
+                has_documents,
+                require_tools,
+            )
+        })
+        .collect()
+}
+
 pub fn create_model_selection_keyboard(
     has_images: bool,
     has_video: bool,
     has_audio: bool,
     has_documents: bool,
+    require_tools: bool,
 ) -> InlineKeyboardMarkup {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     let gemini_button = InlineKeyboardButton::callback(
@@ -459,23 +550,14 @@ pub fn create_model_selection_keyboard(
     let mut first_row = vec![gemini_button];
     let mut third_party_buttons = Vec::new();
 
-    for config in CONFIG.iter_third_party_models() {
-        if !is_third_party_model_available(config) {
-            continue;
-        }
-        if has_documents {
-            continue;
-        }
-        if has_images && !config.image {
-            continue;
-        }
-        if has_video && !config.video {
-            continue;
-        }
-        if has_audio && !config.audio {
-            continue;
-        }
-
+    for config in available_third_party_models_for_request(
+        CONFIG.iter_third_party_models(),
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    ) {
         let model_identifier = config.id.trim();
         if model_identifier.is_empty() {
             continue;
@@ -498,22 +580,186 @@ pub fn create_model_selection_keyboard(
     InlineKeyboardMarkup::new(keyboard)
 }
 
-fn build_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
+fn build_prompt_from_template(template: &str, telegram_user_language_hint: Option<&str>) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    Q_SYSTEM_PROMPT.replace("{current_datetime}", &now).replace(
+    template.replace("{current_datetime}", &now).replace(
         "{telegram_user_language_hint}",
         telegram_user_language_hint.unwrap_or("unknown"),
     )
 }
 
+fn build_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
+    build_prompt_from_template(Q_SYSTEM_PROMPT, telegram_user_language_hint)
+}
+
+fn build_chat_context_system_prompt(telegram_user_language_hint: Option<&str>) -> String {
+    build_prompt_from_template(QC_SYSTEM_PROMPT, telegram_user_language_hint)
+}
+
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn truncate_for_display(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push_str("...");
+    truncated
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatSearchSelection {
+    selected_message_ids: Vec<i64>,
+    note: Option<String>,
+}
+
+fn chat_search_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "selected_message_ids": {
+                "type": "array",
+                "items": { "type": "integer" },
+                "description": "Up to 15 relevant unique message IDs returned by the search tool, ordered most relevant first."
+            },
+            "note": {
+                "type": "string",
+                "description": "Short explanation if fewer than 15 relevant messages were found."
+            }
+        },
+        "required": ["selected_message_ids"],
+        "additionalProperties": false
+    })
+}
+
+fn parse_chat_search_selection(text: &str) -> Option<ChatSearchSelection> {
+    serde_json::from_str::<ChatSearchSelection>(text).ok()
+}
+
+fn format_chat_search_results_html(
+    query: &str,
+    hits: &[crate::db::models::ChatSearchHit],
+    note: Option<&str>,
+    model_name: &str,
+) -> String {
+    let mut lines = vec![format!("<b>Chat search:</b> {}", escape_html(query.trim()))];
+
+    if hits.is_empty() {
+        lines.push("No clearly relevant messages were found.".to_string());
+    } else {
+        for (index, hit) in hits.iter().enumerate() {
+            let username = escape_html(hit.username.as_deref().unwrap_or("Anonymous"));
+            let timestamp = escape_html(&hit.date.format("%Y-%m-%d %H:%M:%S UTC").to_string());
+            let snippet = escape_html(&truncate_for_display(&hit.snippet, 120));
+            let link = hit
+                .link
+                .clone()
+                .or_else(|| build_message_link(hit.chat_id, hit.message_id));
+            let link_html = match link {
+                Some(url) => format!("<a href=\"{}\">message link</a>", escape_html(&url)),
+                None => "link unavailable".to_string(),
+            };
+            lines.push(format!(
+                "{}. {} [{}]: {} {}",
+                index + 1,
+                username,
+                timestamp,
+                snippet,
+                link_html
+            ));
+        }
+    }
+
+    if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("<i>{}</i>", escape_html(note.trim())));
+    }
+    lines.push(format!("<i>Model: {}</i>", escape_html(model_name)));
+    lines.join("\n")
+}
+
+fn split_html_for_telegram(text: &str, max_chars: usize) -> Vec<String> {
+    if text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+
+    for line in text.lines() {
+        let line = if current.is_empty() {
+            line.to_string()
+        } else {
+            format!("\n{line}")
+        };
+        if current.chars().count() + line.chars().count() > max_chars && !current.is_empty() {
+            parts.push(current);
+            current = line.trim_start_matches('\n').to_string();
+        } else {
+            current.push_str(&line);
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    if parts.is_empty() {
+        vec![text.to_string()]
+    } else {
+        parts
+    }
+}
+
+async fn send_chat_search_response(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    response_html: &str,
+) -> Result<()> {
+    let chunks = split_html_for_telegram(response_html, CHAT_SEARCH_MESSAGE_LIMIT);
+    let mut chunks_iter = chunks.into_iter();
+    let first_chunk = chunks_iter.next().unwrap_or_default();
+
+    bot.edit_message_text(chat_id, message_id, first_chunk)
+        .parse_mode(ParseMode::Html)
+        .await?;
+
+    for chunk in chunks_iter {
+        bot.send_message(chat_id, chunk)
+            .parse_mode(ParseMode::Html)
+            .await?;
+    }
+
+    Ok(())
+}
+
 #[allow(deprecated)]
 async fn process_request(
     bot: &Bot,
-    _state: &AppState,
+    state: &AppState,
     request: PendingQRequest,
     model_name: &str,
 ) -> Result<()> {
-    let system_prompt = build_system_prompt(request.telegram_language_code.as_deref());
+    let system_prompt = match request.mode {
+        QaCommandMode::Standard => build_system_prompt(request.telegram_language_code.as_deref()),
+        QaCommandMode::ChatContext => {
+            build_chat_context_system_prompt(request.telegram_language_code.as_deref())
+        }
+    };
 
     let mut query = request.query.clone();
     for content in &request.telegraph_contents {
@@ -537,39 +783,78 @@ async fn process_request(
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), ChatId(request.chat_id), ChatAction::Typing);
 
-    let response = if model_name == MODEL_GEMINI {
-        let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
-        call_gemini(
-            &system_prompt,
-            &query,
-            true,
-            false,
-            Some(&CONFIG.gemini_thinking_level),
-            None,
-            use_pro,
-            Some(request.media_files.clone()),
-            Some(request.youtube_urls.clone()),
-            Some("Q_SYSTEM_PROMPT"),
-        )
-        .await
-        .map(|result| (result.text, Some(result.model_used)))
-    } else {
-        let image_data_list: Vec<Vec<u8>> = request
-            .media_files
-            .iter()
-            .filter(|file| file.kind == MediaKind::Image)
-            .map(|file| file.bytes.clone())
-            .collect();
-        call_third_party(
-            &system_prompt,
-            &query,
-            model_name,
-            "Answer to Your Question",
-            &image_data_list,
-            supports_tools,
-        )
-        .await
-        .map(|result| (result, None))
+    let response = match request.mode {
+        QaCommandMode::Standard => {
+            if model_name == MODEL_GEMINI {
+                let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
+                call_gemini(
+                    &system_prompt,
+                    &query,
+                    true,
+                    false,
+                    Some(&CONFIG.gemini_thinking_level),
+                    None,
+                    use_pro,
+                    Some(request.media_files.clone()),
+                    Some(request.youtube_urls.clone()),
+                    Some("Q_SYSTEM_PROMPT"),
+                )
+                .await
+                .map(|result| (result.text, Some(result.model_used)))
+            } else {
+                let image_data_list: Vec<Vec<u8>> = request
+                    .media_files
+                    .iter()
+                    .filter(|file| file.kind == MediaKind::Image)
+                    .map(|file| file.bytes.clone())
+                    .collect();
+                call_third_party(
+                    &system_prompt,
+                    &query,
+                    model_name,
+                    "Answer to Your Question",
+                    &image_data_list,
+                    supports_tools,
+                )
+                .await
+                .map(|result| (result, None))
+            }
+        }
+        QaCommandMode::ChatContext => {
+            let mut runtime = ToolRuntime::for_qc(state.db.clone(), request.chat_id);
+            if model_name == MODEL_GEMINI {
+                let use_pro = !request.media_files.is_empty() || !request.youtube_urls.is_empty();
+                call_gemini_with_tool_runtime(
+                    &format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance()),
+                    &query,
+                    &mut runtime,
+                    use_pro,
+                    Some(request.media_files.clone()),
+                    Some(request.youtube_urls.clone()),
+                    Some("QC_SYSTEM_PROMPT"),
+                    None,
+                )
+                .await
+                .map(|result| (result.text, Some(result.model_used)))
+            } else {
+                let image_data_list: Vec<Vec<u8>> = request
+                    .media_files
+                    .iter()
+                    .filter(|file| file.kind == MediaKind::Image)
+                    .map(|file| file.bytes.clone())
+                    .collect();
+                call_third_party_with_tool_runtime(
+                    &system_prompt,
+                    &query,
+                    model_name,
+                    "Answer about Chat",
+                    &image_data_list,
+                    &mut runtime,
+                )
+                .await
+                .map(|result| (result, None))
+            }
+        }
     };
     let (response, gemini_model_used) = match response {
         Ok(response) => response,
@@ -611,7 +896,11 @@ async fn process_request(
         ChatId(request.chat_id),
         MessageId(request.selection_message_id as i32),
         &response_text,
-        "Answer to Your Question",
+        if request.mode == QaCommandMode::ChatContext {
+            "Answer about Chat"
+        } else {
+            "Answer to Your Question"
+        },
         ParseMode::Markdown,
     )
     .await?;
@@ -634,6 +923,31 @@ mod tests {
             audio: false,
             tools: true,
         }
+    }
+
+    #[test]
+    fn available_third_party_models_can_require_tools() {
+        let mut without_tools = model(
+            ThirdPartyProvider::OpenRouter,
+            "No Tools",
+            "openrouter/no-tools",
+        );
+        without_tools.tools = false;
+        let models = vec![
+            model(
+                ThirdPartyProvider::OpenRouter,
+                "With Tools",
+                "openrouter/with-tools",
+            ),
+            without_tools,
+        ];
+
+        assert!(third_party_model_matches_request_capabilities(
+            &models[0], false, false, false, false, true,
+        ));
+        assert!(!third_party_model_matches_request_capabilities(
+            &models[1], false, false, false, false, true,
+        ));
     }
 
     #[test]
@@ -687,32 +1001,25 @@ mod tests {
             "shared/model"
         );
         assert_eq!(
-            normalize_model_identifier_with_models(
-                "nvidia:shared/model",
-                &models,
-                &aliases
-            ),
+            normalize_model_identifier_with_models("nvidia:shared/model", &models, &aliases),
             "nvidia:shared/model"
         );
         assert_eq!(
-            normalize_model_identifier_with_models(
-                "openrouter:shared/model",
-                &models,
-                &aliases
-            ),
+            normalize_model_identifier_with_models("openrouter:shared/model", &models, &aliases),
             "openrouter:shared/model"
         );
     }
 }
 
 #[allow(deprecated)]
-pub async fn q_handler(
+async fn q_handler_internal(
     bot: Bot,
     state: AppState,
     message: Message,
     query: Option<String>,
     force_gemini: bool,
     command_name: &str,
+    mode: QaCommandMode,
 ) -> Result<()> {
     if !check_access_control(&bot, &message, command_name).await {
         return Ok(());
@@ -777,7 +1084,10 @@ pub async fn q_handler(
         send_message_with_retry(
             &bot,
             message.chat.id,
-            "Please provide a question or reply to a message with /q.",
+            &format!(
+                "Please provide a question or reply to a message with /{}.",
+                command_name
+            ),
             Some(message.id),
             None,
             None,
@@ -863,12 +1173,19 @@ pub async fn q_handler(
     let has_audio = media_summary.audios > 0;
     let has_documents = media_summary.documents > 0;
 
+    let require_tools = mode.requires_custom_tools();
     let must_use_gemini = force_gemini
         || has_video
         || has_audio
         || has_documents
         || !youtube_urls.is_empty()
-        || !has_available_third_party_models()
+        || !has_available_third_party_models_for_request(
+            has_images,
+            has_video,
+            has_audio,
+            has_documents,
+            require_tools,
+        )
         || CONFIG.iter_third_party_models().is_empty();
     if must_use_gemini {
         let processing_message_text = if has_video {
@@ -915,19 +1232,38 @@ pub async fn q_handler(
         } else {
             media_summary.total > 0 || !youtube_urls.is_empty()
         };
-        let response = call_gemini(
-            &build_system_prompt(user_language_code),
-            &query_text,
-            true,
-            false,
-            Some(&CONFIG.gemini_thinking_level),
-            None,
-            use_pro,
-            Some(media_files.clone()),
-            Some(youtube_urls.clone()),
-            Some("Q_SYSTEM_PROMPT"),
-        )
-        .await;
+        let response = if mode == QaCommandMode::ChatContext {
+            let mut runtime = ToolRuntime::for_qc(state.db.clone(), message.chat.id.0);
+            call_gemini_with_tool_runtime(
+                &format!(
+                    "{}\n\n{}",
+                    build_chat_context_system_prompt(user_language_code),
+                    runtime.tool_limit_guidance()
+                ),
+                &query_text,
+                &mut runtime,
+                use_pro,
+                Some(media_files.clone()),
+                Some(youtube_urls.clone()),
+                Some("QC_SYSTEM_PROMPT"),
+                None,
+            )
+            .await
+        } else {
+            call_gemini(
+                &build_system_prompt(user_language_code),
+                &query_text,
+                true,
+                false,
+                Some(&CONFIG.gemini_thinking_level),
+                None,
+                use_pro,
+                Some(media_files.clone()),
+                Some(youtube_urls.clone()),
+                Some("Q_SYSTEM_PROMPT"),
+            )
+            .await
+        };
         let response = match response {
             Ok(response) => response.text,
             Err(err) => {
@@ -943,7 +1279,11 @@ pub async fn q_handler(
             processing_message.chat.id,
             processing_message.id,
             &response,
-            "Answer to Your Question",
+            if mode == QaCommandMode::ChatContext {
+                "Answer about Chat"
+            } else {
+                "Answer to Your Question"
+            },
             ParseMode::Markdown,
         )
         .await?;
@@ -957,7 +1297,13 @@ pub async fn q_handler(
         selection_text.push_str("\n\n*Note: Only models that support media are shown.*");
     }
 
-    let keyboard = create_model_selection_keyboard(has_images, has_video, has_audio, has_documents);
+    let keyboard = create_model_selection_keyboard(
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        require_tools,
+    );
     let selection_message = send_message_with_retry(
         &bot,
         message.chat.id,
@@ -995,6 +1341,7 @@ pub async fn q_handler(
         reply_to_message_id: message.reply_to_message().map(|msg| msg.id.0 as i64),
         timestamp: now_unix_seconds(),
         command_timer: Some(timer),
+        mode,
     };
 
     state
@@ -1012,7 +1359,12 @@ pub async fn q_handler(
         Some(user_id),
         Some(username),
         Some(format!(
-            "Ask {}: {}",
+            "{} {}: {}",
+            if mode == QaCommandMode::ChatContext {
+                "Ask about chat"
+            } else {
+                "Ask"
+            },
             if CONFIG.telegraph_author_name.trim().is_empty() {
                 "TelegramGroupHelperBot"
             } else {
@@ -1027,6 +1379,174 @@ pub async fn q_handler(
         Some(message.id.0 as i64),
     );
     let _ = state.db.queue_message_insert(db_insert).await;
+
+    Ok(())
+}
+
+pub async fn q_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    query: Option<String>,
+    force_gemini: bool,
+    command_name: &str,
+) -> Result<()> {
+    q_handler_internal(
+        bot,
+        state,
+        message,
+        query,
+        force_gemini,
+        command_name,
+        QaCommandMode::Standard,
+    )
+    .await
+}
+
+pub async fn qc_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    query: Option<String>,
+) -> Result<()> {
+    q_handler_internal(
+        bot,
+        state,
+        message,
+        query,
+        false,
+        "qc",
+        QaCommandMode::ChatContext,
+    )
+    .await
+}
+
+pub async fn s_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    query: Option<String>,
+) -> Result<()> {
+    if !check_access_control(&bot, &message, "s").await {
+        return Ok(());
+    }
+
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+    if is_rate_limited(user_id) {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "You're sending commands too quickly. Please wait a moment before trying again.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let query_text = query
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            message.reply_to_message().and_then(|reply| {
+                reply
+                    .text()
+                    .map(|value| value.to_string())
+                    .or_else(|| reply.caption().map(|value| value.to_string()))
+            })
+        })
+        .unwrap_or_default();
+    if query_text.trim().is_empty() {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            "Please provide a search query or reply to a message with /s.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut timer = start_command_timer("s", &message);
+    let processing_message = send_message_with_retry(
+        &bot,
+        message.chat.id,
+        "Searching this chat...",
+        Some(message.id),
+        None,
+        None,
+    )
+    .await?;
+    let _chat_action =
+        start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
+
+    let mut runtime = ToolRuntime::for_search(state.db.clone(), message.chat.id.0);
+    let response = call_gemini_with_tool_runtime(
+        &format!(
+            "{}\n\n{}",
+            CHAT_SEARCH_SYSTEM_PROMPT,
+            runtime.tool_limit_guidance()
+        ),
+        &query_text,
+        &mut runtime,
+        false,
+        None,
+        None,
+        Some("CHAT_SEARCH_SYSTEM_PROMPT"),
+        Some(chat_search_response_schema()),
+    )
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            let message = format_llm_error_message(MODEL_GEMINI, &err);
+            bot.edit_message_text(processing_message.chat.id, processing_message.id, message)
+                .await?;
+            complete_command_timer(
+                &mut timer,
+                "error",
+                Some("gemini_search_failed".to_string()),
+            );
+            return Err(err);
+        }
+    };
+
+    let selection = parse_chat_search_selection(&response.text);
+    let mut selected_hits = selection
+        .as_ref()
+        .map(|selection| {
+            runtime.select_hits_by_message_ids(
+                &selection.selected_message_ids,
+                CHAT_SEARCH_RESULT_TARGET,
+            )
+        })
+        .unwrap_or_default();
+    if selected_hits.len() > CHAT_SEARCH_RESULT_TARGET {
+        selected_hits.truncate(CHAT_SEARCH_RESULT_TARGET);
+    }
+
+    let note = selection.as_ref().and_then(|value| value.note.as_deref()).or_else(|| {
+        (selected_hits.len() < CHAT_SEARCH_RESULT_TARGET).then_some(
+            "Fewer than 15 clearly relevant messages were found within the 5 allowed search attempts.",
+        )
+    });
+    let response_html =
+        format_chat_search_results_html(&query_text, &selected_hits, note, &response.model_used);
+
+    send_chat_search_response(
+        &bot,
+        processing_message.chat.id,
+        processing_message.id,
+        &response_html,
+    )
+    .await?;
+    complete_command_timer(&mut timer, "success", None);
 
     Ok(())
 }
@@ -1057,12 +1577,13 @@ pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String
     let has_video = summary.videos > 0;
     let has_audio = summary.audios > 0;
     let has_documents = summary.documents > 0;
-    if !model_supports_media(
+    if !is_model_configured_for_request(
         &default_model,
         has_images,
         has_video,
         has_audio,
         has_documents,
+        request.mode.requires_custom_tools(),
     ) {
         default_model = MODEL_GEMINI.to_string();
     }
@@ -1129,7 +1650,19 @@ pub async fn model_selection_callback(
         }
     };
 
-    if !is_model_configured(selected_token) {
+    let summary = summarize_media_files(&request.media_files);
+    let has_images = summary.images > 0;
+    let has_video = summary.videos > 0;
+    let has_audio = summary.audios > 0;
+    let has_documents = summary.documents > 0;
+    if !is_model_configured_for_request(
+        selected_token,
+        has_images,
+        has_video,
+        has_audio,
+        has_documents,
+        request.mode.requires_custom_tools(),
+    ) {
         bot.answer_callback_query(query.id.clone()).await?;
         return Ok(());
     }
@@ -1156,22 +1689,22 @@ pub async fn model_selection_callback(
         return Ok(());
     }
 
-    let summary = summarize_media_files(&request.media_files);
-    let has_images = summary.images > 0;
-    let has_video = summary.videos > 0;
-    let has_audio = summary.audios > 0;
-    let has_documents = summary.documents > 0;
-    if !model_supports_media(
+    if !model_supports_media_for_request(
         &selected_model,
         has_images,
         has_video,
         has_audio,
         has_documents,
+        request.mode.requires_custom_tools(),
     ) {
         bot.edit_message_text(
             message.chat().id,
             message.id(),
-            "Selected model does not support the attached media. Please choose Gemini.",
+            if request.mode == QaCommandMode::ChatContext {
+                "Selected model cannot use the required tool set for this request. Please choose Gemini or a tool-capable model."
+            } else {
+                "Selected model does not support the attached media. Please choose Gemini."
+            },
         )
         .reply_markup(InlineKeyboardMarkup::new(
             Vec::<Vec<InlineKeyboardButton>>::new(),
@@ -1186,7 +1719,6 @@ pub async fn model_selection_callback(
         selected_model.clone()
     };
 
-    let summary = summarize_media_files(&request.media_files);
     let processing_text = if summary.videos > 0 {
         format!(
             "Analyzing video and processing your question with {}...",

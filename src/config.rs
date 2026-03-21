@@ -347,10 +347,7 @@ fn load_third_party_models_from_path(path: &Path) -> Vec<ThirdPartyModelConfig> 
 
     let models = parse_third_party_models_from_str(&raw);
     if models.is_empty() && !raw.trim().is_empty() {
-        info!(
-            "Parsed zero third-party models from {}",
-            path.display()
-        );
+        info!("Parsed zero third-party models from {}", path.display());
     }
     models
 }
@@ -408,7 +405,9 @@ fn build_third_party_models(
             legacy_models.len()
         );
     } else {
-        info!("No third-party models configured via JSON or legacy OpenRouter environment variables");
+        info!(
+            "No third-party models configured via JSON or legacy OpenRouter environment variables"
+        );
     }
     legacy_models
 }
@@ -637,10 +636,7 @@ impl Config {
         &self.third_party_models
     }
 
-    pub fn get_third_party_model_config(
-        &self,
-        model_id: &str,
-    ) -> Option<&ThirdPartyModelConfig> {
+    pub fn get_third_party_model_config(&self, model_id: &str) -> Option<&ThirdPartyModelConfig> {
         self.third_party_models_by_id.get(model_id)
     }
 
