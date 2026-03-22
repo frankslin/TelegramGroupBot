@@ -7,6 +7,7 @@ use tracing::{error, warn};
 
 use crate::config::CONFIG;
 use crate::db::database::build_message_insert;
+use crate::db::search::derive_search_provenance;
 use crate::handlers::content::create_telegraph_page;
 use crate::state::AppState;
 
@@ -111,18 +112,24 @@ pub async fn log_message(state: &AppState, message: &Message) {
         "Anonymous".to_string()
     };
 
+    let provenance = derive_search_provenance(&text);
     let insert = build_message_insert(
         message
             .from
             .as_ref()
             .and_then(|user| i64::try_from(user.id.0).ok()),
         Some(username),
-        Some(text),
+        Some(text.clone()),
         None,
         message.date,
         message.reply_to_message().map(|msg| msg.id.0 as i64),
         Some(message.chat.id.0),
         Some(message.id.0 as i64),
+        None,
+        provenance.asks_ai,
+        provenance.ai_command,
+        provenance.is_command,
+        false,
     );
 
     if let Err(err) = state.db.queue_message_insert(insert).await {

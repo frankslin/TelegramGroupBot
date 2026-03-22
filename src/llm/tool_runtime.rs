@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::db::database::Database;
 use crate::db::models::{ChatSearchHit, MessageRow};
+use crate::db::search::SEARCH_INDEX_REBUILDING_ERROR;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::telegram::build_message_link;
 
@@ -87,6 +88,9 @@ struct ToolMessage {
     date_utc: String,
     text: String,
     link: Option<String>,
+    asks_ai: bool,
+    ai_command: Option<String>,
+    is_synthetic_record: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +102,10 @@ struct ToolSearchHit {
     snippet: String,
     link: Option<String>,
     score: f64,
+    match_stage: String,
+    asks_ai: bool,
+    ai_command: Option<String>,
+    is_synthetic_record: bool,
     context_messages: Vec<ToolMessage>,
 }
 
@@ -450,11 +458,15 @@ impl ToolRuntime {
 
         match self.run_chat_context_query(args).await {
             Ok(payload) => self.success_payload("chat_context_query", payload),
-            Err(err) => self.error_payload(
-                "chat_context_query",
-                "tool_execution_failed",
-                &err.to_string(),
-            ),
+            Err(err) if err.to_string().contains(SEARCH_INDEX_REBUILDING_ERROR) => self
+                .error_payload(
+                    "chat_context_query",
+                    SEARCH_INDEX_REBUILDING_ERROR,
+                    "The chat search index is still rebuilding. Stop using chat_context_query and explain that search is temporarily unavailable.",
+                ),
+            Err(err) => {
+                self.error_payload("chat_context_query", "tool_execution_failed", &err.to_string())
+            }
         }
     }
 
@@ -627,6 +639,9 @@ fn message_row_to_tool_message(row: MessageRow) -> ToolMessage {
         date_utc: row.date.to_rfc3339(),
         text: truncate_tool_text(&row.text.unwrap_or_default()),
         link: build_message_link(row.chat_id, row.message_id),
+        asks_ai: row.asks_ai,
+        ai_command: row.ai_command,
+        is_synthetic_record: row.is_synthetic_record,
     }
 }
 
@@ -639,6 +654,10 @@ fn hit_to_tool_search_hit(hit: ChatSearchHit, context_messages: Vec<ToolMessage>
         snippet: hit.snippet,
         link: hit.link,
         score: hit.score,
+        match_stage: hit.match_stage.label().to_string(),
+        asks_ai: hit.asks_ai,
+        ai_command: hit.ai_command,
+        is_synthetic_record: hit.is_synthetic_record,
         context_messages,
     }
 }

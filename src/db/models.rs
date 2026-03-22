@@ -1,6 +1,8 @@
-﻿use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+
+use crate::db::search::SearchMatchStage;
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct MessageRow {
@@ -13,6 +15,9 @@ pub struct MessageRow {
     pub language: Option<String>,
     pub date: DateTime<Utc>,
     pub reply_to_message_id: Option<i64>,
+    pub asks_ai: bool,
+    pub ai_command: Option<String>,
+    pub is_synthetic_record: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -22,9 +27,14 @@ pub struct MessageInsert {
     pub user_id: Option<i64>,
     pub username: Option<String>,
     pub text: Option<String>,
+    pub search_source_text: Option<String>,
     pub language: Option<String>,
     pub date: DateTime<Utc>,
     pub reply_to_message_id: Option<i64>,
+    pub asks_ai: bool,
+    pub ai_command: Option<String>,
+    pub is_command: bool,
+    pub is_synthetic_record: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,4 +50,8 @@ pub struct ChatSearchHit {
     pub snippet: String,
     pub link: Option<String>,
     pub score: f64,
+    pub asks_ai: bool,
+    pub ai_command: Option<String>,
+    pub is_synthetic_record: bool,
+    pub match_stage: SearchMatchStage,
 }

@@ -596,6 +596,13 @@ fn build_chat_context_system_prompt(telegram_user_language_hint: Option<&str>) -
     build_prompt_from_template(QC_SYSTEM_PROMPT, telegram_user_language_hint)
 }
 
+fn chat_search_rebuilding_message(command_name: &str) -> String {
+    format!(
+        "The chat search index is rebuilding right now. Please try /{} again in a few minutes.",
+        command_name
+    )
+}
+
 fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -665,6 +672,12 @@ fn format_chat_search_results_html(
             let username = escape_html(hit.username.as_deref().unwrap_or("Anonymous"));
             let timestamp = escape_html(&hit.date.format("%Y-%m-%d %H:%M:%S UTC").to_string());
             let snippet = escape_html(&truncate_for_display(&hit.snippet, 120));
+            let provenance_prefix = if hit.asks_ai {
+                let command = hit.ai_command.as_deref().unwrap_or("q");
+                format!("[AI ask /{}] ", escape_html(command))
+            } else {
+                String::new()
+            };
             let link = hit
                 .link
                 .clone()
@@ -674,10 +687,11 @@ fn format_chat_search_results_html(
                 None => "link unavailable".to_string(),
             };
             lines.push(format!(
-                "{}. {} [{}]: {} {}",
+                "{}. {} [{}]: {}{} {}",
                 index + 1,
                 username,
                 timestamp,
+                provenance_prefix,
                 snippet,
                 link_html
             ));
@@ -754,6 +768,16 @@ async fn process_request(
     request: PendingQRequest,
     model_name: &str,
 ) -> Result<()> {
+    if request.mode == QaCommandMode::ChatContext && !state.db.is_search_ready() {
+        bot.edit_message_text(
+            ChatId(request.chat_id),
+            MessageId(request.selection_message_id as i32),
+            chat_search_rebuilding_message("qc"),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let system_prompt = match request.mode {
         QaCommandMode::Standard => build_system_prompt(request.telegram_language_code.as_deref()),
         QaCommandMode::ChatContext => {
@@ -1096,6 +1120,19 @@ async fn q_handler_internal(
         return Ok(());
     }
 
+    if mode == QaCommandMode::ChatContext && !state.db.is_search_ready() {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            &chat_search_rebuilding_message("qc"),
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let mut query_text = query_text_raw.clone();
     if !query_text.trim().is_empty() {
         let (query_text_processed, query_telegraph) =
@@ -1358,25 +1395,21 @@ async fn q_handler_internal(
     let db_insert = build_message_insert(
         Some(user_id),
         Some(username),
-        Some(format!(
-            "{} {}: {}",
-            if mode == QaCommandMode::ChatContext {
-                "Ask about chat"
-            } else {
-                "Ask"
-            },
-            if CONFIG.telegraph_author_name.trim().is_empty() {
-                "TelegramGroupHelperBot"
-            } else {
-                &CONFIG.telegraph_author_name
-            },
-            db_query_text
-        )),
+        message
+            .text()
+            .map(|value| value.to_string())
+            .or_else(|| message.caption().map(|value| value.to_string()))
+            .or_else(|| Some(original_query.clone())),
         None,
         message.date,
         message.reply_to_message().map(|msg| msg.id.0 as i64),
         Some(message.chat.id.0),
         Some(message.id.0 as i64),
+        Some(db_query_text.clone()),
+        true,
+        Some(command_name.to_string()),
+        true,
+        true,
     );
     let _ = state.db.queue_message_insert(db_insert).await;
 
@@ -1465,6 +1498,19 @@ pub async fn s_handler(
             &bot,
             message.chat.id,
             "Please provide a search query or reply to a message with /s.",
+            Some(message.id),
+            None,
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !state.db.is_search_ready() {
+        send_message_with_retry(
+            &bot,
+            message.chat.id,
+            &chat_search_rebuilding_message("s"),
             Some(message.id),
             None,
             None,
