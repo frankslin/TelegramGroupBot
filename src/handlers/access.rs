@@ -84,14 +84,19 @@ pub fn is_access_allowed(user_id: i64, chat_id: i64) -> bool {
     is_user_whitelisted(user_id) || is_chat_whitelisted(chat_id)
 }
 
+fn normalize_command_name(command: &str) -> String {
+    command.trim().trim_start_matches('/').to_ascii_lowercase()
+}
+
 pub fn requires_access_control(command: &str) -> bool {
     if CONFIG.access_controlled_commands.is_empty() {
         return false;
     }
+    let command = normalize_command_name(command);
     CONFIG
         .access_controlled_commands
         .iter()
-        .any(|entry| entry == command)
+        .any(|entry| normalize_command_name(entry) == command)
 }
 
 pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -> bool {
@@ -118,6 +123,17 @@ pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_command_name;
+
+    #[test]
+    fn normalize_command_name_trims_slash_and_case() {
+        assert_eq!(normalize_command_name("/ProfileMe "), "profileme");
+        assert_eq!(normalize_command_name("mysong"), "mysong");
+    }
 }
 
 pub async fn check_admin_access(bot: &Bot, message: &Message, command: &str) -> bool {

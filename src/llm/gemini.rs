@@ -31,6 +31,15 @@ pub struct GeminiCallResult {
     pub model_used: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct GeminiMusicGenerationResult {
+    pub lyrics_text: String,
+    pub notes_text: Option<String>,
+    pub audio_bytes: Vec<u8>,
+    pub audio_mime_type: String,
+    pub model_used: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GeminiResponse {
     candidates: Option<Vec<GeminiCandidate>>,
@@ -109,6 +118,8 @@ struct UploadedFileRef {
 const GEMINI_MAX_RETRY_ATTEMPTS: usize = 2;
 const GEMINI_LITE_FALLBACK_MAX_ATTEMPTS: usize = 3;
 const GEMINI_RETRY_BASE_DELAY_MS: u64 = 900;
+const GEMINI_DEFAULT_TIMEOUT_SECS: u64 = 90;
+const LYRIA_GENERATION_TIMEOUT_SECS: u64 = 240;
 const VEO_DEFAULT_RESOLUTION: &str = "1080p";
 const VEO_DEFAULT_DURATION_SECONDS: u32 = 8;
 const VEO_DEFAULT_ASPECT_RATIO: &str = "16:9";
@@ -804,10 +815,38 @@ async fn call_gemini_api(
     Ok(parsed)
 }
 
+async fn call_gemini_api_with_timeout(
+    model: &str,
+    payload: serde_json::Value,
+    system_prompt_label: Option<&str>,
+    timeout: Duration,
+) -> Result<GeminiResponse> {
+    let value =
+        call_gemini_api_value_with_timeout(model, payload, system_prompt_label, timeout).await?;
+    let parsed = serde_json::from_value::<GeminiResponse>(value)
+        .map_err(|err| anyhow!("Gemini generateContent response decode failed: {}", err))?;
+    Ok(parsed)
+}
+
 async fn call_gemini_api_value(
     model: &str,
     payload: serde_json::Value,
     system_prompt_label: Option<&str>,
+) -> Result<Value> {
+    call_gemini_api_value_with_timeout(
+        model,
+        payload,
+        system_prompt_label,
+        Duration::from_secs(GEMINI_DEFAULT_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn call_gemini_api_value_with_timeout(
+    model: &str,
+    payload: serde_json::Value,
+    system_prompt_label: Option<&str>,
+    timeout: Duration,
 ) -> Result<Value> {
     let client = get_http_client();
     let url = format!(
@@ -825,7 +864,7 @@ async fn call_gemini_api_value(
         attempt += 1;
         let response = match client
             .post(&url)
-            .timeout(Duration::from_secs(90))
+            .timeout(timeout)
             .json(&payload)
             .send()
             .await
@@ -897,6 +936,95 @@ async fn call_gemini_api_value(
         }
         return Ok(value);
     }
+}
+
+fn text_part_looks_like_music_metadata(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.starts_with("Caption:") {
+        return true;
+    }
+
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.contains('{'))
+    {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("\nbpm:")
+        || lower.starts_with("bpm:")
+        || lower.contains("\nmusic:")
+        || lower.starts_with("music:")
+        || lower.contains("\ncaption:")
+}
+
+fn extract_music_generation_result(
+    response: GeminiResponse,
+    model: &str,
+) -> Result<GeminiMusicGenerationResult> {
+    let mut lyric_parts = Vec::new();
+    let mut note_parts = Vec::new();
+    let mut audio_bytes = None;
+    let mut audio_mime_type = None;
+
+    for candidate in response.candidates.unwrap_or_default() {
+        if let Some(content) = candidate.content {
+            if let Some(parts) = content.parts {
+                for part in parts {
+                    match part {
+                        GeminiPart::Text { text } => {
+                            let trimmed = text.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+
+                            if text_part_looks_like_music_metadata(trimmed) {
+                                note_parts.push(trimmed.to_string());
+                            } else {
+                                lyric_parts.push(trimmed.to_string());
+                            }
+                        }
+                        GeminiPart::InlineData { inline_data } => {
+                            if inline_data.mime_type.starts_with("audio/") {
+                                let bytes = general_purpose::STANDARD
+                                    .decode(&inline_data.data)
+                                    .map_err(|err| {
+                                        anyhow!("Failed to decode Lyria audio payload: {}", err)
+                                    })?;
+                                audio_mime_type = Some(inline_data.mime_type);
+                                audio_bytes = Some(bytes);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    if lyric_parts.is_empty() && !note_parts.is_empty() {
+        lyric_parts = note_parts.clone();
+        note_parts.clear();
+    }
+
+    let audio_bytes =
+        audio_bytes.ok_or_else(|| anyhow!("No audio returned by Lyria (model: {})", model))?;
+
+    Ok(GeminiMusicGenerationResult {
+        lyrics_text: lyric_parts.join("\n\n"),
+        notes_text: if note_parts.is_empty() {
+            None
+        } else {
+            Some(note_parts.join("\n\n"))
+        },
+        audio_bytes,
+        audio_mime_type: audio_mime_type.unwrap_or_else(|| "audio/mpeg".to_string()),
+        model_used: model.to_string(),
+    })
 }
 
 fn extract_text_from_response_value(response: &Value) -> String {
@@ -1420,6 +1548,52 @@ pub async fn generate_image_with_gemini(
     Ok(images)
 }
 
+pub async fn generate_music_with_lyria(
+    prompt: &str,
+) -> Result<GeminiMusicGenerationResult, anyhow::Error> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err(anyhow!("Music prompt is empty"));
+    }
+
+    let model = CONFIG.gemini_music_model.trim();
+    if model.is_empty() {
+        return Err(anyhow!("GEMINI_MUSIC_MODEL is not configured"));
+    }
+
+    let payload = json!({
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": prompt }]
+        }],
+        "generationConfig": {
+            "responseModalities": ["AUDIO", "TEXT"]
+        },
+        "safetySettings": build_safety_settings(),
+    });
+
+    let response = log_llm_timing(
+        "gemini",
+        model,
+        "lyria_generate_content",
+        Some(json!({
+            "response_modalities": ["AUDIO", "TEXT"]
+        })),
+        || async {
+            call_gemini_api_with_timeout(
+                model,
+                payload.clone(),
+                Some("lyria_music_generation"),
+                Duration::from_secs(LYRIA_GENERATION_TIMEOUT_SECS),
+            )
+            .await
+        },
+    )
+    .await?;
+
+    extract_music_generation_result(response, model)
+}
+
 pub async fn generate_video_with_veo(
     user_prompt: &str,
 ) -> Result<(Option<Vec<u8>>, Option<String>), anyhow::Error> {
@@ -1595,4 +1769,62 @@ pub async fn generate_video_with_veo(
 
     warn!("Veo operation timed out after polling");
     Ok((None, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_music_generation_result_collects_lyrics_audio_and_notes() {
+        let response: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "[Intro]\nA bright beginning" },
+                        { "text": "Caption: upbeat indie pop with layered harmonies\nBPM: 112" },
+                        {
+                            "inlineData": {
+                                "mimeType": "audio/mpeg",
+                                "data": general_purpose::STANDARD.encode(b"song-bytes")
+                            }
+                        }
+                    ]
+                }
+            }]
+        }))
+        .expect("valid music response");
+
+        let result =
+            extract_music_generation_result(response, "lyria-3-pro-preview").expect("music");
+
+        assert_eq!(result.lyrics_text, "[Intro]\nA bright beginning");
+        assert_eq!(
+            result.notes_text.as_deref(),
+            Some("Caption: upbeat indie pop with layered harmonies\nBPM: 112")
+        );
+        assert_eq!(result.audio_bytes, b"song-bytes");
+        assert_eq!(result.audio_mime_type, "audio/mpeg");
+        assert_eq!(result.model_used, "lyria-3-pro-preview");
+    }
+
+    #[test]
+    fn extract_music_generation_result_errors_when_audio_is_missing() {
+        let response: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "[Verse]\nNo audio returned" }
+                    ]
+                }
+            }]
+        }))
+        .expect("valid music response");
+
+        let err = extract_music_generation_result(response, "lyria-3-pro-preview").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("No audio returned by Lyria (model: lyria-3-pro-preview)"));
+    }
 }

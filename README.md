@@ -21,6 +21,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/img` - Generate or edit an image with Gemini.
 - `/image` - Generate an image with selectable resolution and aspect ratio.
 - `/vid` - Generate a video from text.
+- `/mysong` - Generate a theme song from your chat history.
 - `/profileme` - Generate a profile based on your chat history.
 - `/paintme` - Create an artistic prompt based on your history.
 - `/portraitme` - Create a portrait prompt based on your history.
@@ -83,19 +84,22 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `TELEGRAM_MAX_LENGTH` - Max message length before truncation or Telegraph. Default: `4000`.
 - `USER_HISTORY_MESSAGE_COUNT` - Messages to retain for user history. Default: `200`.
 - `LOG_LEVEL` - Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info`.
+- `PUBLISH_BOT_COMMANDS` - When `true`, publish the built-in command list on startup via Telegram `setMyCommands`. Default: `false`.
+  - Warning: Telegram treats this as a replacement for the default-scope command list. Leave it `false` if you manage commands in BotFather.
 
 ### Access control
 - `WHITELIST_FILE_PATH` - Path to whitelist file. Default: `allowed_chat.txt`.
   - File contents: one user ID or chat ID per line. Empty or missing file means no restrictions.
   - `/status` and `/diagnose` require this whitelist file to be present and include your user ID or chat ID.
 - `ACCESS_CONTROLLED_COMMANDS` - Comma-separated list of commands requiring whitelist access.
-  - Example: `/tldr,/factcheck,/profileme`
+  - Example: `/tldr,/factcheck,/profileme,/mysong`
 
 ### Gemini settings
 - `GEMINI_MODEL` - Default Gemini model. Default: `gemini-2.0-flash`.
 - `GEMINI_LITE_MODEL` - Lite fallback model after `GEMINI_MODEL` failures. Default: `gemini-2.0-flash-lite`.
 - `GEMINI_PRO_MODEL` - Pro model. Default: `gemini-2.5-pro-exp-03-25`.
 - `GEMINI_IMAGE_MODEL` - Image model. Default: `gemini-3-pro-image-preview`.
+- `GEMINI_MUSIC_MODEL` - Music model for `/mysong`. Default: `lyria-3-pro-preview`.
 - `GEMINI_VIDEO_MODEL` - Video model. Default: `veo-3.1-generate-preview`.
 - `GEMINI_TEMPERATURE` - Default: `0.7`.
 - `GEMINI_TOP_K` - Default: `40`.

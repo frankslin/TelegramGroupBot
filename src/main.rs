@@ -1,8 +1,11 @@
 use std::error::Error;
 
+use anyhow::anyhow;
 use dotenvy::dotenv;
+use serde::{Deserialize, Serialize};
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
+use teloxide::types::BotCommand;
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info, warn};
 
@@ -19,6 +22,7 @@ use db::database::Database;
 use handlers::qa::MODEL_CALLBACK_PREFIX;
 use handlers::{commands, qa};
 use state::AppState;
+use utils::http::get_http_client;
 use utils::logging::init_logging;
 
 #[derive(BotCommands, Clone)]
@@ -54,6 +58,8 @@ enum Command {
     Image(String),
     #[command(description = "用 Veo 生成视频")]
     Vid(String),
+    #[command(description = "基于你在本群的聊天记录生成你的主题歌")]
+    Mysong(String),
     #[command(description = "基于你在本群的聊天记录生成个人简介")]
     Profileme(String),
     #[command(description = "基于你在本群的聊天记录生成艺术形象")]
@@ -70,28 +76,127 @@ enum Command {
 
 type HandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
-fn public_bot_commands() -> Vec<teloxide::types::BotCommand> {
-    const PUBLIC_COMMAND_NAMES: &[&str] = &[
-        "start",
-        "help",
-        "tldr",
-        "factcheck",
-        "q",
-        "qc",
-        "qq",
-        "s",
-        "img",
-        "image",
-        "profileme",
-        "paintme",
-        "portraitme",
-        "support",
-    ];
+#[derive(Debug, Deserialize)]
+struct TelegramApiResponse<T> {
+    ok: bool,
+    result: Option<T>,
+    description: Option<String>,
+    error_code: Option<u16>,
+}
 
-    Command::bot_commands()
-        .into_iter()
-        .filter(|command| PUBLIC_COMMAND_NAMES.contains(&command.command.as_str()))
-        .collect()
+#[derive(Debug, Serialize)]
+struct SetMyCommandsRequest<'a> {
+    commands: &'a [BotCommand],
+}
+
+async fn publish_bot_commands(bot_token: &str, commands: &[BotCommand]) -> anyhow::Result<()> {
+    let url = format!("https://api.telegram.org/bot{bot_token}/setMyCommands");
+    let response = get_http_client()
+        .post(url)
+        .json(&SetMyCommandsRequest { commands })
+        .send()
+        .await
+        .map_err(|_| anyhow!("Telegram setMyCommands HTTP request failed"))?;
+    let status = response.status();
+    let payload: TelegramApiResponse<bool> = response
+        .json()
+        .await
+        .map_err(|_| anyhow!("Telegram setMyCommands response decode failed"))?;
+
+    if !status.is_success() || !payload.ok || payload.result != Some(true) {
+        let error_code = payload.error_code.unwrap_or(status.as_u16());
+        let description = payload
+            .description
+            .unwrap_or_else(|| "unknown Telegram API error".to_string());
+        return Err(anyhow!(
+            "Telegram setMyCommands failed (status {}): {}",
+            error_code,
+            description
+        ));
+    }
+
+    let published_commands = fetch_bot_commands(bot_token).await?;
+    if published_commands.len() != commands.len() {
+        warn!(
+            "Telegram reported {} published default-scope command(s) after setMyCommands; expected {}",
+            published_commands.len(),
+            commands.len()
+        );
+    } else {
+        info!(
+            "Telegram now reports {} published default-scope command(s)",
+            published_commands.len()
+        );
+    }
+
+    Ok(())
+}
+
+async fn fetch_bot_commands(bot_token: &str) -> anyhow::Result<Vec<BotCommand>> {
+    let url = format!("https://api.telegram.org/bot{bot_token}/getMyCommands");
+    let response = get_http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| anyhow!("Telegram getMyCommands HTTP request failed"))?;
+    let status = response.status();
+    let payload: TelegramApiResponse<Vec<BotCommand>> = response
+        .json()
+        .await
+        .map_err(|_| anyhow!("Telegram getMyCommands response decode failed"))?;
+
+    if !status.is_success() || !payload.ok {
+        let error_code = payload.error_code.unwrap_or(status.as_u16());
+        let description = payload
+            .description
+            .unwrap_or_else(|| "unknown Telegram API error".to_string());
+        return Err(anyhow!(
+            "Telegram getMyCommands failed (status {}): {}",
+            error_code,
+            description
+        ));
+    }
+
+    Ok(payload.result.unwrap_or_default())
+}
+
+fn public_bot_commands() -> Vec<BotCommand> {
+    vec![
+        BotCommand::new("start", "介绍AI小喵和可用指令"),
+        BotCommand::new("help", "查看帮助与指令说明"),
+        BotCommand::new(
+            "tldr",
+            "汇总最近 N 条消息（默认 100 条，可用 /tldr 50 指定数量）",
+        ),
+        BotCommand::new(
+            "factcheck",
+            "回复一条文字/图片/视频/音频消息进行事实核查，支持消息内的 Telegraph/Twitter/YouTube 链接",
+        ),
+        BotCommand::new(
+            "q",
+            "提问或分析媒体，弹出模型选择（默认 Gemini，自动隐藏不支持当前媒体的模型）",
+        ),
+        BotCommand::new(
+            "qq",
+            "Quick Question（快问快答），小喵会用Gemini的低思考级别尽量快捷地回答你的问题",
+        ),
+        BotCommand::new(
+            "qc",
+            "询问本群聊里的历史内容，可检索当前聊天记录并在需要时联网搜索",
+        ),
+        BotCommand::new("s", "搜索本群聊相关消息，返回命中的消息摘要和直达链接"),
+        BotCommand::new(
+            "img",
+            "用 Gemini（或已配置的 Vertex）生成/编辑图片，可直接描述或回复图片/贴纸",
+        ),
+        BotCommand::new("image", "与 /img 相同，但附带分辨率与长宽比按钮"),
+        BotCommand::new("vid", "用 Veo 生成视频"),
+        BotCommand::new("profileme", "基于你在本群的聊天记录生成个人简介"),
+        BotCommand::new("paintme", "基于你在本群的聊天记录生成艺术形象"),
+        BotCommand::new("portraitme", "基于你在本群的聊天记录生成肖像"),
+        BotCommand::new("mysong", "基于你在本群的聊天记录生成你的主题歌"),
+        BotCommand::new("support", "投喂AI小喵"),
+    ]
 }
 
 #[tokio::main]
@@ -113,8 +218,21 @@ async fn main() -> HandlerResult {
     let state = AppState::new(db, bot_user_id, bot_username_lower);
 
     handlers::access::load_whitelist();
-    if let Err(err) = bot.set_my_commands(public_bot_commands()).await {
-        warn!("Failed to publish bot command descriptions: {err}");
+    if CONFIG.publish_bot_commands {
+        let commands = public_bot_commands();
+        info!(
+            "Publishing {} bot commands to Telegram because PUBLISH_BOT_COMMANDS=true; \
+             this replaces the default-scope command list managed by BotFather",
+            commands.len()
+        );
+        if let Err(err) = publish_bot_commands(&CONFIG.bot_token, &commands).await {
+            warn!("Failed to publish bot command descriptions: {err:#}");
+        }
+    } else {
+        info!(
+            "Skipping Telegram command publishing; leave PUBLISH_BOT_COMMANDS=false \
+             when BotFather manages the command list"
+        );
     }
 
     let command_handler = dptree::entry()
@@ -266,6 +384,17 @@ async fn handle_command(
             tokio::spawn(async move {
                 if let Err(err) = commands::vid_handler(bot, message, arg).await {
                     error!("vid handler failed: {err}");
+                }
+            });
+        }
+        Command::Mysong(arg) => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let arg = optional_arg(arg);
+            tokio::spawn(async move {
+                if let Err(err) = commands::mysong_handler(bot, state, message, arg).await {
+                    error!("mysong handler failed: {err}");
                 }
             });
         }

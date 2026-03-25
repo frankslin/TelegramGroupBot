@@ -27,7 +27,8 @@ use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
-    call_gemini, generate_image_with_gemini, generate_video_with_veo, GeminiImageConfig,
+    call_gemini, generate_image_with_gemini, generate_music_with_lyria, generate_video_with_veo,
+    GeminiImageConfig,
 };
 use crate::state::{AppState, MediaGroupItem, PendingImageRequest};
 use crate::tools::cwd_uploader::upload_image_bytes_to_cwd;
@@ -50,6 +51,44 @@ const IMAGE_CAPTION_PROMPT_PREVIEW: usize = 900;
 const VID_TELEGRAM_RETRY_ATTEMPTS: usize = 3;
 const DIAGNOSE_LOG_TAIL_LINES: usize = 12;
 const DIAGNOSE_TEXT_LIMIT: usize = 3900;
+const MYSONG_DEFAULT_LANGUAGE: &str = "English";
+const MYSONG_SUMMARY_SYSTEM_PROMPT: &str = r#"You are preparing a music-generation brief for a Telegram user's personal theme song.
+
+Analyze the user's recent chat history and summarize only stable patterns, not one-off comments.
+
+Output plain text with these headings exactly:
+Persona:
+Communication style:
+Recurring interests:
+Emotional tone:
+Social role in the chat:
+Music style cues:
+Theme song angle:
+Language cues:
+Constraints:
+
+Requirements:
+- Infer personality, rhythm, energy, humor, and likely musical vibe from the user's writing style.
+- Suggest plausible genre, instrumentation, tempo, and vocal feel that match the user's chatting style.
+- Do not quote the user's messages.
+- Do not include timestamps, message IDs, or usernames.
+- Keep it concise and useful for a music prompt writer.
+- Always reply in English."#;
+const MYSONG_PROMPT_SYSTEM_PROMPT: &str = r#"You are an expert prompt engineer for Google's Lyria 3 Pro music-generation model.
+
+You will receive a persona summary plus optional user instructions. Your task is to write one final prompt for a full-length theme song about that user.
+
+Requirements for the final prompt:
+- Any explicit user direction about language, era, genre, instrumentation, or style is a hard requirement and must be preserved.
+- Use the persona summary for subject matter and emotional tone, but do not override explicit user directions with your own defaults.
+- Make it a full song of about 2 minutes.
+- Match the musical style to the user's chatting style.
+- Include genre, instrumentation, mood, tempo/BPM, vocal style, production details, and overall atmosphere.
+- Request clear structure using tags such as [Intro], [Verse], [Chorus], [Bridge], and [Outro].
+- Ask for memorable lyrics about the user's vibe, habits, interests, worldview, and role in the group.
+- Do not mention timestamps, usernames, message IDs, or direct quotes from the chat history.
+- Do not request any specific artist, band, or copyrighted lyrics.
+- Output only the final Lyria prompt text, with no markdown fences or explanation."#;
 
 #[derive(Debug, Clone)]
 struct ImageRequestContext {
@@ -59,11 +98,191 @@ struct ImageRequestContext {
     original_message_text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysongLanguageSelection {
+    target_language: &'static str,
+    fallback_notice: Option<String>,
+}
+
 fn strip_command_prefix(text: &str, command_prefix: &str) -> String {
     if text.starts_with(command_prefix) {
         text[command_prefix.len()..].trim().to_string()
     } else {
         text.to_string()
+    }
+}
+
+fn format_user_history_for_persona(history: &[crate::db::models::MessageRow]) -> String {
+    let mut formatted = String::from("Here is the user's recent chat history in this group:\n\n");
+    for msg in history {
+        let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
+        let text = msg.text.as_deref().unwrap_or_default();
+        formatted.push_str(&format!("{}: {}\n", timestamp, text));
+    }
+    formatted
+}
+
+fn note_mentions_any(note: &str, ascii_keywords: &[&str], native_keywords: &[&str]) -> bool {
+    let lower = note.to_ascii_lowercase();
+    ascii_keywords.iter().any(|keyword| lower.contains(keyword))
+        || native_keywords.iter().any(|keyword| note.contains(keyword))
+}
+
+fn resolve_mysong_language(note: Option<&str>) -> MysongLanguageSelection {
+    let Some(note) = note.filter(|value| !value.trim().is_empty()) else {
+        return MysongLanguageSelection {
+            target_language: MYSONG_DEFAULT_LANGUAGE,
+            fallback_notice: None,
+        };
+    };
+
+    for (display_name, ascii_keywords, native_keywords) in [
+        ("English", vec!["english"], vec!["英语", "英文"]),
+        ("German", vec!["german"], vec!["德语", "德文"]),
+        ("Spanish", vec!["spanish"], vec!["西班牙语", "西语", "西文"]),
+        ("French", vec!["french"], vec!["法语", "法文"]),
+        ("Hindi", vec!["hindi"], vec!["印地语", "印度语"]),
+        (
+            "Japanese",
+            vec!["japanese", "j-pop", "anime song", "anisong"],
+            vec!["日语", "日文", "日本语", "日语歌", "日文歌", "日本动漫"],
+        ),
+        (
+            "Korean",
+            vec!["korean", "k-pop"],
+            vec!["韩语", "韓語", "韩文", "韓文"],
+        ),
+        ("Portuguese", vec!["portuguese"], vec!["葡语", "葡萄牙语"]),
+    ] {
+        if note_mentions_any(note, &ascii_keywords, &native_keywords) {
+            return MysongLanguageSelection {
+                target_language: display_name,
+                fallback_notice: None,
+            };
+        }
+    }
+
+    for (display_name, ascii_keywords, native_keywords) in [
+        (
+            "Chinese",
+            vec!["chinese", "mandarin", "cantonese"],
+            vec!["中文", "汉语", "漢語", "国语", "國語", "粤语", "粵語"],
+        ),
+        ("Italian", vec!["italian"], vec!["意大利语", "意语"]),
+        ("Arabic", vec!["arabic"], vec!["阿拉伯语"]),
+        ("Russian", vec!["russian"], vec!["俄语", "俄文"]),
+        ("Turkish", vec!["turkish"], vec!["土耳其语"]),
+        ("Vietnamese", vec!["vietnamese"], vec!["越南语"]),
+    ] {
+        if note_mentions_any(note, &ascii_keywords, &native_keywords) {
+            return MysongLanguageSelection {
+                target_language: MYSONG_DEFAULT_LANGUAGE,
+                fallback_notice: Some(format!(
+                    "Lyria 3 currently does not support {} lyrics here, so I generated the song in English instead.",
+                    display_name
+                )),
+            };
+        }
+    }
+
+    MysongLanguageSelection {
+        target_language: MYSONG_DEFAULT_LANGUAGE,
+        fallback_notice: None,
+    }
+}
+
+fn build_mysong_prompt_request(
+    persona_summary: &str,
+    note: Option<&str>,
+    target_language: &str,
+) -> String {
+    let mut request = format!(
+        "Target lyric language: {}\n\nPersona summary:\n{}\n",
+        target_language,
+        persona_summary.trim()
+    );
+
+    if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
+        request
+            .push_str("\nMandatory user direction (must be preserved exactly where possible):\n");
+        request.push_str(note.trim());
+        request.push('\n');
+    }
+
+    request.push_str(&format!(
+        "\nWrite the final Lyria prompt entirely in {} and explicitly request vocals and lyrics in {}. Treat any explicit era, genre, anime/J-pop reference, instrumentation request, or language request from the user direction as mandatory.",
+        target_language, target_language
+    ));
+    request
+}
+
+fn audio_file_name_for_mime(mime_type: &str) -> &'static str {
+    match mime_type.trim().to_ascii_lowercase().as_str() {
+        "audio/wav" | "audio/x-wav" => "mysong.wav",
+        _ => "mysong.mp3",
+    }
+}
+
+fn audio_should_use_send_audio(mime_type: &str) -> bool {
+    matches!(
+        mime_type.trim().to_ascii_lowercase().as_str(),
+        "audio/mpeg" | "audio/mp3"
+    )
+}
+
+fn build_mysong_lyrics_message(
+    lyrics_text: &str,
+    notes_text: Option<&str>,
+    fallback_notice: Option<&str>,
+) -> String {
+    let mut message = String::new();
+    if let Some(fallback_notice) = fallback_notice.filter(|value| !value.trim().is_empty()) {
+        message.push_str(fallback_notice.trim());
+        message.push_str("\n\n");
+    }
+
+    message.push_str("Lyrics\n\n");
+    message.push_str(lyrics_text.trim());
+
+    if let Some(notes_text) = notes_text.filter(|value| !value.trim().is_empty()) {
+        message.push_str("\n\nSong Notes\n\n");
+        message.push_str(notes_text.trim());
+    }
+
+    message
+}
+
+async fn build_mysong_audio_caption(
+    lyrics_message: &str,
+    model_name: &str,
+    prompt_language: &str,
+) -> String {
+    let base_caption = format!(
+        "Generated by {} in {}.",
+        escape_html(model_name),
+        escape_html(prompt_language)
+    );
+
+    if let Some(url) = create_telegraph_page("Your Theme Song Lyrics", lyrics_message).await {
+        return format!(
+            "{}\n<a href=\"{}\">Lyrics and notes</a>",
+            base_caption,
+            escape_html(&url)
+        );
+    }
+
+    let (preview, was_truncated) = truncate_chars(lyrics_message, 700);
+    let preview = if was_truncated {
+        format!("{}...", preview)
+    } else {
+        preview
+    };
+
+    let caption = format!("{}\n<pre>{}</pre>", base_caption, escape_html(&preview));
+    if caption.chars().count() <= IMAGE_CAPTION_LIMIT {
+        caption
+    } else {
+        base_caption
     }
 }
 
@@ -515,6 +734,65 @@ async fn send_video_with_retry(
     }
 
     unreachable!("send_video retry loop exhausted")
+}
+
+async fn send_audio_file_with_retry(
+    bot: &Bot,
+    chat_id: ChatId,
+    audio_bytes: &[u8],
+    mime_type: &str,
+    caption: Option<&str>,
+    reply_to: Option<MessageId>,
+) -> Result<Message> {
+    let mut delay = Duration::from_secs_f32(1.5);
+    let file_name = audio_file_name_for_mime(mime_type);
+
+    for attempt in 0..VID_TELEGRAM_RETRY_ATTEMPTS {
+        let input = InputFile::memory(audio_bytes.to_vec()).file_name(file_name.to_string());
+        let send_audio = audio_should_use_send_audio(mime_type);
+
+        let result = if send_audio {
+            let mut request = bot.send_audio(chat_id, input);
+            if let Some(reply_to) = reply_to {
+                request = request.reply_parameters(ReplyParameters::new(reply_to));
+            }
+            if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
+                request = request
+                    .caption(caption.to_string())
+                    .parse_mode(ParseMode::Html);
+            }
+            request.await
+        } else {
+            let mut request = bot.send_document(chat_id, input);
+            if let Some(reply_to) = reply_to {
+                request = request.reply_parameters(ReplyParameters::new(reply_to));
+            }
+            if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
+                request = request
+                    .caption(caption.to_string())
+                    .parse_mode(ParseMode::Html);
+            }
+            request.await
+        };
+
+        match result {
+            Ok(message) => return Ok(message),
+            Err(err) => {
+                if !telegram_retryable_error(&err) || attempt + 1 == VID_TELEGRAM_RETRY_ATTEMPTS {
+                    return Err(err.into());
+                }
+                warn!("send_audio/document attempt {} failed: {err}", attempt + 1);
+                if let RequestError::RetryAfter(wait) = err {
+                    tokio::time::sleep(wait.duration()).await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    }
+
+    unreachable!("send_audio/document retry loop exhausted")
 }
 
 async fn prepare_image_request(
@@ -1683,6 +1961,184 @@ pub async fn profileme_handler(
     Ok(())
 }
 
+#[allow(deprecated)]
+pub async fn mysong_handler(
+    bot: Bot,
+    state: AppState,
+    message: Message,
+    note: Option<String>,
+) -> Result<()> {
+    if !check_access_control(&bot, &message, "mysong").await {
+        return Ok(());
+    }
+
+    let user_id = message
+        .from
+        .as_ref()
+        .and_then(|user| i64::try_from(user.id.0).ok())
+        .unwrap_or_default();
+    if is_rate_limited(user_id) {
+        bot.send_message(
+            message.chat.id,
+            "Rate limit exceeded. Please try again later.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+
+    let mut timer = start_command_timer("mysong", &message);
+    let processing_message = send_message_with_retry(
+        &bot,
+        message.chat.id,
+        "Composing your theme song... This can take a little while.",
+        Some(message.id),
+    )
+    .await?;
+
+    let result: Result<()> = async {
+        let _chat_action =
+            start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::Typing);
+
+        let history = state
+            .db
+            .select_messages_by_user(
+                message.chat.id.0,
+                user_id,
+                CONFIG.user_history_message_count,
+                true,
+            )
+            .await?;
+
+        if history.is_empty() {
+            edit_message_text_with_retry(
+                &bot,
+                message.chat.id,
+                processing_message.id,
+                "I don't have enough of your messages in this chat yet.",
+            )
+            .await?;
+            complete_command_timer(&mut timer, "error", Some("no_history".to_string()));
+            return Ok(());
+        }
+
+        let formatted_history = format_user_history_for_persona(&history);
+        let language_selection = resolve_mysong_language(note.as_deref());
+
+        let persona_summary = call_gemini(
+            MYSONG_SUMMARY_SYSTEM_PROMPT,
+            &formatted_history,
+            false,
+            false,
+            Some(&CONFIG.gemini_thinking_level),
+            None,
+            false,
+            None,
+            None,
+            Some("MYSONG_SUMMARY_SYSTEM_PROMPT"),
+        )
+        .await?;
+
+        edit_message_text_with_retry(
+            &bot,
+            message.chat.id,
+            processing_message.id,
+            "Writing the final song prompt...",
+        )
+        .await?;
+
+        let prompt_request = build_mysong_prompt_request(
+            &persona_summary.text,
+            note.as_deref(),
+            language_selection.target_language,
+        );
+        let lyria_prompt = call_gemini(
+            MYSONG_PROMPT_SYSTEM_PROMPT,
+            &prompt_request,
+            false,
+            false,
+            Some(&CONFIG.gemini_thinking_level),
+            None,
+            true,
+            None,
+            None,
+            Some("MYSONG_PROMPT_SYSTEM_PROMPT"),
+        )
+        .await?
+        .text;
+
+        edit_message_text_with_retry(
+            &bot,
+            message.chat.id,
+            processing_message.id,
+            "Generating your song with Lyria 3 Pro...",
+        )
+        .await?;
+
+        let song = generate_music_with_lyria(&lyria_prompt).await?;
+
+        edit_message_text_with_retry(
+            &bot,
+            message.chat.id,
+            processing_message.id,
+            "Sending your song and lyrics...",
+        )
+        .await?;
+
+        let _upload_chat_action =
+            start_chat_action_heartbeat(bot.clone(), message.chat.id, ChatAction::UploadDocument);
+        let lyrics_message = build_mysong_lyrics_message(
+            &song.lyrics_text,
+            song.notes_text.as_deref(),
+            language_selection.fallback_notice.as_deref(),
+        );
+        let audio_caption = build_mysong_audio_caption(
+            &lyrics_message,
+            &song.model_used,
+            language_selection.target_language,
+        )
+        .await;
+        send_audio_file_with_retry(
+            &bot,
+            message.chat.id,
+            &song.audio_bytes,
+            &song.audio_mime_type,
+            Some(&audio_caption),
+            Some(message.id),
+        )
+        .await?;
+
+        let _ = bot
+            .delete_message(processing_message.chat.id, processing_message.id)
+            .await;
+
+        complete_command_timer(
+            &mut timer,
+            "success",
+            Some(format!(
+                "model={} language={}",
+                song.model_used, language_selection.target_language
+            )),
+        );
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = result {
+        complete_command_timer(&mut timer, "error", Some(err.to_string()));
+        error!("mysong generation failed: {err}");
+        let _ = edit_message_text_with_retry(
+            &bot,
+            message.chat.id,
+            processing_message.id,
+            "Failed to generate your theme song. Please try again later.",
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
 pub async fn paintme_handler(
     bot: Bot,
     state: AppState,
@@ -1875,6 +2331,10 @@ Usage: `/vid [text prompt]`
 Usage: `/profileme`
 Or: `/profileme [Language style of the profile]`
 
+/mysong - Generate a theme song about you from your chat history in this group.
+Usage: `/mysong`
+Or: `/mysong [optional style or language direction]`
+
 /paintme - Generate an image representing you based on your chat history in this group.
 Usage: `/paintme`
 
@@ -1975,5 +2435,47 @@ pub async fn handle_media_group(state: AppState, message: Message) {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_mysong_language_defaults_to_english() {
+        let selection = resolve_mysong_language(None);
+
+        assert_eq!(selection.target_language, "English");
+        assert_eq!(selection.fallback_notice, None);
+    }
+
+    #[test]
+    fn resolve_mysong_language_uses_supported_override() {
+        let selection = resolve_mysong_language(Some("make it dreamy and sing it in Japanese"));
+
+        assert_eq!(selection.target_language, "Japanese");
+        assert_eq!(selection.fallback_notice, None);
+    }
+
+    #[test]
+    fn resolve_mysong_language_detects_japanese_in_chinese_text() {
+        let selection = resolve_mysong_language(Some("90年代日本动漫风格，日语歌"));
+
+        assert_eq!(selection.target_language, "Japanese");
+        assert_eq!(selection.fallback_notice, None);
+    }
+
+    #[test]
+    fn resolve_mysong_language_falls_back_for_unsupported_request() {
+        let selection = resolve_mysong_language(Some("please sing it in Chinese"));
+
+        assert_eq!(selection.target_language, "English");
+        assert_eq!(
+            selection.fallback_notice.as_deref(),
+            Some(
+                "Lyria 3 currently does not support Chinese lyrics here, so I generated the song in English instead."
+            )
+        );
     }
 }

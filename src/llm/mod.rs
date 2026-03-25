@@ -9,6 +9,6 @@ pub mod web_search;
 
 pub use gemini::{
     call_gemini, call_gemini_with_tool_runtime, generate_image_with_gemini,
-    generate_video_with_veo, GeminiImageConfig,
+    generate_music_with_lyria, generate_video_with_veo, GeminiImageConfig,
 };
 pub use third_party::{call_third_party, call_third_party_with_tool_runtime};
