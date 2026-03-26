@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -51,6 +52,8 @@ const IMAGE_CAPTION_PROMPT_PREVIEW: usize = 900;
 const VID_TELEGRAM_RETRY_ATTEMPTS: usize = 3;
 const DIAGNOSE_LOG_TAIL_LINES: usize = 12;
 const DIAGNOSE_TEXT_LIMIT: usize = 3900;
+const MYSONG_LLM_MAX_ATTEMPTS: usize = 3;
+const MYSONG_LLM_RETRY_BASE_DELAY_MS: u64 = 2_000;
 const MYSONG_DEFAULT_LANGUAGE: &str = "English";
 const MYSONG_SUMMARY_SYSTEM_PROMPT: &str = r#"You are preparing a music-generation brief for a Telegram user's personal theme song.
 
@@ -795,6 +798,51 @@ async fn send_audio_file_with_retry(
     unreachable!("send_audio/document retry loop exhausted")
 }
 
+async fn retry_mysong_llm_step<T, F, Fut>(
+    bot: &Bot,
+    chat_id: ChatId,
+    processing_message_id: MessageId,
+    step_name: &str,
+    retry_status_template: &str,
+    mut action: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut delay = Duration::from_millis(MYSONG_LLM_RETRY_BASE_DELAY_MS);
+
+    for attempt in 1..=MYSONG_LLM_MAX_ATTEMPTS {
+        match action().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt == MYSONG_LLM_MAX_ATTEMPTS {
+                    return Err(err);
+                }
+
+                warn!(
+                    "mysong {} failed on attempt {}/{}: {}",
+                    step_name, attempt, MYSONG_LLM_MAX_ATTEMPTS, err
+                );
+                let retry_status = retry_status_template
+                    .replace("{attempt}", &attempt.to_string())
+                    .replace("{max}", &MYSONG_LLM_MAX_ATTEMPTS.to_string());
+                let _ = edit_message_text_with_retry(
+                    bot,
+                    chat_id,
+                    processing_message_id,
+                    &retry_status,
+                )
+                .await;
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+
+    unreachable!("mysong llm retry loop exhausted")
+}
+
 async fn prepare_image_request(
     bot: &Bot,
     state: &AppState,
@@ -964,6 +1012,23 @@ fn build_aspect_ratio_keyboard(request_key: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(rows)
 }
 
+fn resolve_image_request_settings(
+    request: &PendingImageRequest,
+    resolution: Option<&str>,
+    aspect_ratio: Option<&str>,
+) -> (String, String) {
+    let final_resolution = resolution
+        .or(request.resolution.as_deref())
+        .unwrap_or(IMAGE_DEFAULT_RESOLUTION)
+        .to_string();
+    let final_aspect = aspect_ratio
+        .or(request.aspect_ratio.as_deref())
+        .unwrap_or(IMAGE_DEFAULT_ASPECT_RATIO)
+        .to_string();
+
+    (final_resolution, final_aspect)
+}
+
 async fn finalize_image_request(
     bot: &Bot,
     state: &AppState,
@@ -976,8 +1041,8 @@ async fn finalize_image_request(
         return Ok(());
     };
 
-    let final_resolution = resolution.unwrap_or(IMAGE_DEFAULT_RESOLUTION);
-    let final_aspect = aspect_ratio.unwrap_or(IMAGE_DEFAULT_ASPECT_RATIO);
+    let (final_resolution, final_aspect) =
+        resolve_image_request_settings(&request, resolution, aspect_ratio);
 
     let mut prompt = request.prompt.clone();
     if !request.telegraph_contents.is_empty() {
@@ -992,12 +1057,12 @@ async fn finalize_image_request(
         aspect_ratio: if final_aspect.trim().is_empty() {
             None
         } else {
-            Some(final_aspect.to_string())
+            Some(final_aspect.clone())
         },
         image_size: if final_resolution.trim().is_empty() {
             None
         } else {
-            Some(final_resolution.to_string())
+            Some(final_resolution.clone())
         },
     });
 
@@ -2025,17 +2090,27 @@ pub async fn mysong_handler(
         let formatted_history = format_user_history_for_persona(&history);
         let language_selection = resolve_mysong_language(note.as_deref());
 
-        let persona_summary = call_gemini(
-            MYSONG_SUMMARY_SYSTEM_PROMPT,
-            &formatted_history,
-            false,
-            false,
-            Some(&CONFIG.gemini_thinking_level),
-            None,
-            false,
-            None,
-            None,
-            Some("MYSONG_SUMMARY_SYSTEM_PROMPT"),
+        let persona_summary = retry_mysong_llm_step(
+            &bot,
+            message.chat.id,
+            processing_message.id,
+            "persona summary generation",
+            "Summarizing your chat style failed, retrying ({attempt}/{max})...",
+            || async {
+                call_gemini(
+                    MYSONG_SUMMARY_SYSTEM_PROMPT,
+                    &formatted_history,
+                    false,
+                    false,
+                    Some(&CONFIG.gemini_thinking_level),
+                    None,
+                    false,
+                    None,
+                    None,
+                    Some("MYSONG_SUMMARY_SYSTEM_PROMPT"),
+                )
+                .await
+            },
         )
         .await?;
 
@@ -2052,17 +2127,27 @@ pub async fn mysong_handler(
             note.as_deref(),
             language_selection.target_language,
         );
-        let lyria_prompt = call_gemini(
-            MYSONG_PROMPT_SYSTEM_PROMPT,
-            &prompt_request,
-            false,
-            false,
-            Some(&CONFIG.gemini_thinking_level),
-            None,
-            true,
-            None,
-            None,
-            Some("MYSONG_PROMPT_SYSTEM_PROMPT"),
+        let lyria_prompt = retry_mysong_llm_step(
+            &bot,
+            message.chat.id,
+            processing_message.id,
+            "final prompt generation",
+            "Writing the final song prompt failed, retrying ({attempt}/{max})...",
+            || async {
+                call_gemini(
+                    MYSONG_PROMPT_SYSTEM_PROMPT,
+                    &prompt_request,
+                    false,
+                    false,
+                    Some(&CONFIG.gemini_thinking_level),
+                    None,
+                    true,
+                    None,
+                    None,
+                    Some("MYSONG_PROMPT_SYSTEM_PROMPT"),
+                )
+                .await
+            },
         )
         .await?
         .text;
@@ -2075,7 +2160,19 @@ pub async fn mysong_handler(
         )
         .await?;
 
-        let song = generate_music_with_lyria(&lyria_prompt).await?;
+        let song = retry_mysong_llm_step(
+            &bot,
+            message.chat.id,
+            processing_message.id,
+            "Lyria song generation",
+            "Generating your song failed, retrying ({attempt}/{max})...",
+            || async {
+                generate_music_with_lyria(&lyria_prompt)
+                    .await
+                    .map_err(Into::into)
+            },
+        )
+        .await?;
 
         edit_message_text_with_retry(
             &bot,
@@ -2296,62 +2393,64 @@ pub async fn help_handler(bot: Bot, message: Message) -> Result<()> {
         return Ok(());
     }
 
-    let help_text = "
-*TelegramGroupHelperBot Commands*
+    let help_text = r#"
+*TelegramGroupHelperBot 指令说明*
 
-/tldr - Summarize previous messages in the chat
-Usage: Reply to a message with `/tldr` to summarize all messages between that message and the present.
+/tldr - 汇总最近 N 条消息
+用法：回复一条消息后发送 `/tldr`，会汇总从那条消息到现在的聊天内容。
+也可以直接使用 `/tldr 50` 指定汇总最近 50 条消息。
 
-/factcheck - Fact-check a statement or text
-Usage: `/factcheck [statement]` or reply to a message with `/factcheck`
+/factcheck - 对文字、图片、视频、音频消息做事实核查
+用法：`/factcheck [要核查的内容]`
+或回复一条消息后发送 `/factcheck`
 
-/q - Ask a question
-Usage: `/q [your question]`
+/q - 提问或分析媒体内容
+用法：`/q [你的问题]`
 
-/qc - Ask a question about this chat using same-chat retrieval
-Usage: `/qc [your question]`
+/qc - 询问本群历史内容
+用法：`/qc [你的问题]`
 
-/qq - Quick Gemini answer using the default Gemini model
-Usage: `/qq [your quick question]`
+/qq - Quick Question（快问快答）
+用法：`/qq [你的问题]`
 
-/s - Search this chat and return relevant message links
-Usage: `/s [search query]`
+/s - 搜索本群相关消息并返回直达链接
+用法：`/s [搜索关键词]`
 
-/img - Generate or edit an image using Gemini
-Usage: `/img [description]` for generating a new image
-Or reply to an image with `/img [description]` to edit that image
+/img - 用 Gemini 生成或编辑图片
+用法：`/img [描述]` 用于生成新图片
+或回复一张图片后发送 `/img [描述]` 来编辑图片
 
-/image - Generate or edit an image with resolution and aspect ratio choices
-Usage: `/image [description]` and pick resolution (2K/4K/1K) and aspect ratio
+/image - 与 /img 相同，但会让你选择分辨率和长宽比
+用法：`/image [描述]`，然后选择分辨率（2K/4K/1K）和长宽比
 
-/vid - Generate a video
-Usage: `/vid [text prompt]`
+/vid - 用 Veo 生成视频
+用法：`/vid [文本提示词]`
 
-/profileme - Generate your user profile based on your chat history in this group.
-Usage: `/profileme`
-Or: `/profileme [Language style of the profile]`
+/profileme - 基于你在本群的聊天记录生成个人简介
+用法：`/profileme`
+或：`/profileme [简介风格说明]`
 
-/mysong - Generate a theme song about you from your chat history in this group.
-Usage: `/mysong`
-Or: `/mysong [optional style or language direction]`
+/mysong - 基于你在本群的聊天记录生成你的主题歌
+用法：`/mysong`
+或：`/mysong [风格、语言或额外要求]`
 
-/paintme - Generate an image representing you based on your chat history in this group.
-Usage: `/paintme`
+/paintme - 基于你在本群的聊天记录生成艺术形象
+用法：`/paintme`
 
-/portraitme - Generate a portrait of you based on your chat history in this group.
-Usage: `/portraitme`
+/portraitme - 基于你在本群的聊天记录生成肖像
+用法：`/portraitme`
 
-/status - Show bot health snapshot (admin-only)
-Usage: `/status`
+/status - 查看机器人状态（仅管理员）
+用法：`/status`
 
-/diagnose - Show extended diagnostics with recent log tails (admin-only)
-Usage: `/diagnose`
+/diagnose - 查看扩展诊断信息与最近日志（仅管理员）
+用法：`/diagnose`
 
-/support - Show support information and Ko-fi link
-Usage: `/support`
+/support - 查看投喂信息
+用法：`/support`
 
-/help - Show this help message
-";
+/help - 查看这份帮助说明
+"#;
 
     bot.send_message(message.chat.id, help_text)
         .reply_parameters(ReplyParameters::new(message.id))
@@ -2477,5 +2576,27 @@ mod tests {
                 "Lyria 3 currently does not support Chinese lyrics here, so I generated the song in English instead."
             )
         );
+    }
+
+    #[test]
+    fn resolve_image_request_settings_prefers_saved_resolution_and_aspect_ratio() {
+        let request = PendingImageRequest {
+            user_id: 1,
+            chat_id: 2,
+            message_id: 3,
+            prompt: "test".to_string(),
+            image_urls: Vec::new(),
+            telegraph_contents: Vec::new(),
+            original_message_text: "test".to_string(),
+            selection_message_id: 4,
+            resolution: Some("4K".to_string()),
+            aspect_ratio: Some("16:9".to_string()),
+        };
+
+        let (final_resolution, final_aspect) =
+            resolve_image_request_settings(&request, None, Some("1:1"));
+
+        assert_eq!(final_resolution, "4K");
+        assert_eq!(final_aspect, "1:1");
     }
 }
