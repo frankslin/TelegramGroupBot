@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
+use crate::llm::responses_provider::{
+    call_responses_provider, call_responses_provider_with_tool_runtime,
+};
+use crate::llm::runtime_models::{is_runtime_provider_ready, runtime_model_config};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
 use crate::utils::http::get_http_client;
@@ -300,9 +304,14 @@ fn provider_runtime_config(provider: ThirdPartyProvider) -> Result<ProviderRunti
             top_p: CONFIG.nvidia_top_p,
             top_k: None,
         },
+        ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex => {
+            return Err(anyhow!(
+                "Responses providers are handled by the responses provider adapter"
+            ));
+        }
     };
 
-    if !CONFIG.is_third_party_provider_ready(provider) {
+    if !is_runtime_provider_ready(provider) {
         return Err(anyhow!(
             "{} is not enabled or its API key is missing",
             config.display_name
@@ -699,7 +708,22 @@ pub async fn call_third_party_with_tool_runtime(
     let model_config = CONFIG
         .get_third_party_model_config(model_id)
         .cloned()
+        .or_else(|| runtime_model_config(model_id))
         .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))?;
+    if matches!(
+        model_config.provider,
+        ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
+    ) {
+        return call_responses_provider_with_tool_runtime(
+            system_prompt,
+            user_content,
+            &model_config,
+            response_title,
+            image_data_list,
+            runtime,
+        )
+        .await;
+    }
     let system_prompt = format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance());
     let message_content = build_message_content(user_content, image_data_list);
     let messages = vec![
@@ -737,7 +761,22 @@ pub async fn call_third_party(
     let model_config = CONFIG
         .get_third_party_model_config(model_id)
         .cloned()
+        .or_else(|| runtime_model_config(model_id))
         .ok_or_else(|| anyhow!("Unknown third-party model '{}'", model_id))?;
+    if matches!(
+        model_config.provider,
+        ThirdPartyProvider::OpenAI | ThirdPartyProvider::OpenAICodex
+    ) {
+        return call_responses_provider(
+            system_prompt,
+            user_content,
+            &model_config,
+            response_title,
+            image_data_list,
+            supports_tools,
+        )
+        .await;
+    }
     let tools_enabled = supports_tools && web_search::is_search_enabled();
     let system_prompt = build_third_party_system_prompt(system_prompt, tools_enabled);
     let message_content = build_message_content(user_content, image_data_list);

@@ -17,10 +17,15 @@ pub struct ModelCapabilities {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum ThirdPartyProvider {
+    #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "nvidia")]
     Nvidia,
+    #[serde(rename = "openai")]
+    OpenAI,
+    #[serde(rename = "openai-codex")]
+    OpenAICodex,
 }
 
 impl ThirdPartyProvider {
@@ -28,6 +33,8 @@ impl ThirdPartyProvider {
         match self {
             ThirdPartyProvider::OpenRouter => "openrouter",
             ThirdPartyProvider::Nvidia => "nvidia",
+            ThirdPartyProvider::OpenAI => "openai",
+            ThirdPartyProvider::OpenAICodex => "openai-codex",
         }
     }
 }
@@ -39,6 +46,8 @@ impl std::str::FromStr for ThirdPartyProvider {
         match value.trim().to_lowercase().as_str() {
             "openrouter" => Ok(ThirdPartyProvider::OpenRouter),
             "nvidia" => Ok(ThirdPartyProvider::Nvidia),
+            "openai" => Ok(ThirdPartyProvider::OpenAI),
+            "openai-codex" => Ok(ThirdPartyProvider::OpenAICodex),
             other => Err(anyhow::anyhow!(
                 "Unsupported third-party model provider '{}'",
                 other
@@ -138,6 +147,15 @@ pub struct Config {
     pub nvidia_temperature: f32,
     pub nvidia_top_k: i32,
     pub nvidia_top_p: f32,
+    pub enable_openai: bool,
+    pub openai_api_key: String,
+    pub openai_base_url: String,
+    pub enable_openai_codex: bool,
+    pub openai_codex_base_url: String,
+    pub openai_codex_originator: String,
+    pub openai_codex_client_version: String,
+    pub openai_codex_auth_path: String,
+    pub openai_codex_model_path: String,
     pub enable_jina_mcp: bool,
     pub jina_ai_api_key: String,
     pub jina_search_endpoint: String,
@@ -594,6 +612,24 @@ impl Config {
             nvidia_temperature: env_f32("NVIDIA_TEMPERATURE", 0.7),
             nvidia_top_k: env_i32("NVIDIA_TOP_K", 40),
             nvidia_top_p: env_f32("NVIDIA_TOP_P", 0.95),
+            enable_openai: env_bool("ENABLE_OPENAI", false),
+            openai_api_key: env_string("OPENAI_API_KEY", ""),
+            openai_base_url: env_string("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            enable_openai_codex: env_bool("ENABLE_OPENAI_CODEX", true),
+            openai_codex_base_url: env_string(
+                "OPENAI_CODEX_BASE_URL",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            openai_codex_originator: env_string("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs"),
+            openai_codex_client_version: env_string("OPENAI_CODEX_CLIENT_VERSION", "0.99.0"),
+            openai_codex_auth_path: env_string(
+                "OPENAI_CODEX_AUTH_PATH",
+                "data/openai_codex_auth.json",
+            ),
+            openai_codex_model_path: env_string(
+                "OPENAI_CODEX_MODEL_PATH",
+                "data/openai_codex_model.json",
+            ),
             enable_jina_mcp: env_bool("ENABLE_JINA_MCP", false),
             jina_ai_api_key: env_string("JINA_AI_API_KEY", ""),
             jina_search_endpoint: env_string("JINA_SEARCH_ENDPOINT", "https://s.jina.ai/search"),
@@ -652,6 +688,10 @@ impl Config {
             ThirdPartyProvider::Nvidia => {
                 self.enable_nvidia && !self.nvidia_api_key.trim().is_empty()
             }
+            ThirdPartyProvider::OpenAI => {
+                self.enable_openai && !self.openai_api_key.trim().is_empty()
+            }
+            ThirdPartyProvider::OpenAICodex => self.enable_openai_codex,
         }
     }
 }
@@ -733,13 +773,27 @@ mod tests {
                     "image": true,
                     "audio": true,
                     "tools": false
+                },
+                {
+                    "provider": "openai",
+                    "name": "GPT-5.4 API",
+                    "model": "gpt-5.4",
+                    "image": true,
+                    "tools": true
+                },
+                {
+                    "provider": "openai-codex",
+                    "name": "Codex Selected",
+                    "model": "selected",
+                    "image": true,
+                    "tools": true
                 }
             ]
         }"#;
 
         let models = parse_third_party_models_from_str(raw);
 
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 4);
         assert_eq!(
             models[0].id,
             "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"
@@ -750,6 +804,10 @@ mod tests {
         assert!(models[1].image);
         assert!(models[1].audio);
         assert!(!models[1].tools);
+        assert_eq!(models[2].provider, ThirdPartyProvider::OpenAI);
+        assert_eq!(models[2].id, "openai:gpt-5.4");
+        assert_eq!(models[3].provider, ThirdPartyProvider::OpenAICodex);
+        assert_eq!(models[3].id, "openai-codex:selected");
     }
 
     #[test]

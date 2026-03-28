@@ -24,6 +24,10 @@ use crate::handlers::media::{
 };
 use crate::handlers::responses::send_response;
 use crate::llm::media::MediaKind;
+use crate::llm::runtime_models::{
+    is_runtime_provider_ready, resolve_runtime_model_identifier, runtime_model_config,
+    runtime_model_count, runtime_models,
+};
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::{
     call_gemini, call_gemini_with_tool_runtime, call_third_party,
@@ -198,6 +202,8 @@ fn third_party_provider_label(provider: ThirdPartyProvider) -> &'static str {
     match provider {
         ThirdPartyProvider::OpenRouter => "OpenRouter",
         ThirdPartyProvider::Nvidia => "NVIDIA",
+        ThirdPartyProvider::OpenAI => "OpenAI",
+        ThirdPartyProvider::OpenAICodex => "OpenAI Codex",
     }
 }
 
@@ -205,8 +211,7 @@ fn configured_model_display_name(model_name: &str) -> String {
     if model_name == MODEL_GEMINI {
         "Gemini".to_string()
     } else {
-        CONFIG
-            .get_third_party_model_config(model_name)
+        runtime_model_config(model_name)
             .map(|config| config.name.clone())
             .unwrap_or_else(|| model_name.to_string())
     }
@@ -214,8 +219,7 @@ fn configured_model_display_name(model_name: &str) -> String {
 
 fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
     let display_model = configured_model_display_name(model_name);
-    let provider = CONFIG
-        .get_third_party_model_config(model_name)
+    let provider = runtime_model_config(model_name)
         .map(|config| third_party_provider_label(config.provider));
     let err_text = err.to_string();
 
@@ -394,6 +398,10 @@ fn normalize_model_identifier_with_models(
 }
 
 fn normalize_model_identifier(identifier: &str) -> String {
+    if let Some(resolved) = resolve_runtime_model_identifier(identifier) {
+        return resolved;
+    }
+
     let mapping = [
         ("llama", CONFIG.llama_model.as_str()),
         ("grok", CONFIG.grok_model.as_str()),
@@ -401,11 +409,12 @@ fn normalize_model_identifier(identifier: &str) -> String {
         ("deepseek", CONFIG.deepseek_model.as_str()),
         ("gpt", CONFIG.gpt_model.as_str()),
     ];
-    normalize_model_identifier_with_models(identifier, CONFIG.iter_third_party_models(), &mapping)
+    let models = runtime_models();
+    normalize_model_identifier_with_models(identifier, &models, &mapping)
 }
 
 fn is_third_party_model_available(config: &ThirdPartyModelConfig) -> bool {
-    CONFIG.is_third_party_provider_ready(config.provider)
+    is_runtime_provider_ready(config.provider)
 }
 
 fn has_available_third_party_models_for_request(
@@ -415,8 +424,9 @@ fn has_available_third_party_models_for_request(
     has_documents: bool,
     require_tools: bool,
 ) -> bool {
+    let models = runtime_models();
     !available_third_party_models_for_request(
-        CONFIG.iter_third_party_models(),
+        &models,
         has_images,
         has_video,
         has_audio,
@@ -431,7 +441,7 @@ fn is_model_configured(model_key: &str) -> bool {
     if normalized == MODEL_GEMINI {
         return true;
     }
-    CONFIG.get_third_party_model_config(&normalized).is_some()
+    runtime_model_config(&normalized).is_some()
 }
 
 fn is_model_configured_for_request(
@@ -468,14 +478,14 @@ fn model_supports_media_for_request(
         return false;
     }
 
-    let Some(config) = CONFIG.get_third_party_model_config(model_name) else {
+    let Some(config) = runtime_model_config(model_name) else {
         return false;
     };
-    if !is_third_party_model_available(config) {
+    if !is_third_party_model_available(&config) {
         return false;
     }
     third_party_model_matches_request_capabilities(
-        config,
+        &config,
         has_images,
         has_video,
         has_audio,
@@ -549,9 +559,10 @@ pub fn create_model_selection_keyboard(
 
     let mut first_row = vec![gemini_button];
     let mut third_party_buttons = Vec::new();
+    let models = runtime_models();
 
     for config in available_third_party_models_for_request(
-        CONFIG.iter_third_party_models(),
+        &models,
         has_images,
         has_video,
         has_audio,
@@ -798,8 +809,7 @@ async fn process_request(
     let supports_tools = if model_name == MODEL_GEMINI {
         true
     } else {
-        CONFIG
-            .get_third_party_model_config(model_name)
+        runtime_model_config(model_name)
             .map(|config| config.tools)
             .unwrap_or(false)
     };
@@ -907,7 +917,7 @@ async fn process_request(
                 .as_deref()
                 .unwrap_or(CONFIG.gemini_model.as_str())
                 .to_string()
-        } else if let Some(config) = CONFIG.get_third_party_model_config(model_name) {
+        } else if let Some(config) = runtime_model_config(model_name) {
             config.model.clone()
         } else {
             model_name.to_string()
@@ -1223,7 +1233,7 @@ async fn q_handler_internal(
             has_documents,
             require_tools,
         )
-        || CONFIG.iter_third_party_models().is_empty();
+        || runtime_model_count() == 0;
     if must_use_gemini {
         let processing_message_text = if has_video {
             "Analyzing video and processing your question...".to_string()

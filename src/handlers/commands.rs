@@ -26,6 +26,10 @@ use crate::handlers::media::{
 };
 use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
+use crate::llm::openai_codex;
+use crate::llm::runtime_models::{
+    runtime_model_count, selected_codex_model_record,
+};
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
     call_gemini, generate_image_with_gemini, generate_music_with_lyria, generate_video_with_veo,
@@ -383,6 +387,7 @@ fn redact_sensitive_text(text: &str) -> String {
         CONFIG.gemini_api_key.as_str(),
         CONFIG.openrouter_api_key.as_str(),
         CONFIG.nvidia_api_key.as_str(),
+        CONFIG.openai_api_key.as_str(),
         CONFIG.jina_ai_api_key.as_str(),
         CONFIG.brave_search_api_key.as_str(),
         CONFIG.exa_api_key.as_str(),
@@ -440,6 +445,13 @@ async fn build_status_report(state: &AppState) -> String {
         CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenRouter);
     let nvidia_ready =
         CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::Nvidia);
+    let openai_ready =
+        CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenAI);
+    let codex_auth = openai_codex::auth_summary();
+    let codex_selected_model = selected_codex_model_record();
+    let codex_ready =
+        crate::llm::runtime_models::is_runtime_provider_ready(crate::config::ThirdPartyProvider::OpenAICodex);
+    let active_codex_login = state.active_codex_login.lock().clone();
 
     let whitelist_path = Path::new(&CONFIG.whitelist_file_path);
     let whitelist_ready = whitelist_path.exists();
@@ -465,13 +477,76 @@ async fn build_status_report(state: &AppState) -> String {
         bool_label(openrouter_ready)
     ));
     report.push_str(&format!("nvidia_ready: {}\n", bool_label(nvidia_ready)));
+    report.push_str(&format!("openai_ready: {}\n", bool_label(openai_ready)));
+    report.push_str(&format!("openai_codex_ready: {}\n", bool_label(codex_ready)));
+    report.push_str(&format!(
+        "openai_codex_auth_file: {}\n",
+        CONFIG.openai_codex_auth_path
+    ));
+    report.push_str(&format!(
+        "openai_codex_auth_present: {}\n",
+        bool_label(codex_auth.auth_file_exists)
+    ));
+    if let Some(auth_mode) = codex_auth.auth_mode {
+        report.push_str(&format!("openai_codex_auth_mode: {}\n", auth_mode));
+    }
+    if let Some(plan_type) = codex_auth.plan_type {
+        report.push_str(&format!("openai_codex_plan_type: {}\n", plan_type));
+    }
+    if let Some(account_id) = codex_auth.account_id {
+        report.push_str(&format!("openai_codex_account_id: {}\n", account_id));
+    }
+    if let Some(email) = codex_auth.email {
+        report.push_str(&format!("openai_codex_email: {}\n", email));
+    }
+    if let Some(last_refresh) = codex_auth.last_refresh {
+        report.push_str(&format!(
+            "openai_codex_last_refresh: {}\n",
+            last_refresh.to_rfc3339()
+        ));
+    }
+    report.push_str(&format!(
+        "openai_codex_model_file: {}\n",
+        CONFIG.openai_codex_model_path
+    ));
+    report.push_str(&format!(
+        "openai_codex_client_version: {}\n",
+        CONFIG.openai_codex_client_version
+    ));
+    if let Some(model) = codex_selected_model {
+        report.push_str(&format!(
+            "openai_codex_selected_model: {} ({})\n",
+            model.display_name, model.slug
+        ));
+        if let Some(level) = model.selected_reasoning_level {
+            report.push_str(&format!("openai_codex_reasoning_override: {}\n", level));
+        } else if let Some(level) = model.default_reasoning_level {
+            report.push_str(&format!("openai_codex_reasoning_default: {}\n", level));
+        }
+    }
+    report.push_str(&format!(
+        "openai_codex_login_pending: {}\n",
+        bool_label(active_codex_login.is_some())
+    ));
+    if let Some(login) = active_codex_login {
+        report.push_str(&format!("openai_codex_login_user_id: {}\n", login.admin_user_id));
+        report.push_str(&format!("openai_codex_login_chat_id: {}\n", login.chat_id));
+        report.push_str(&format!(
+            "openai_codex_login_started_at: {}\n",
+            login.started_at
+        ));
+        report.push_str(&format!(
+            "openai_codex_login_status_message_id: {}\n",
+            login.status_message_id
+        ));
+    }
     report.push_str(&format!(
         "third_party_models_config_path: {}\n",
         CONFIG.third_party_models_config_path.display()
     ));
     report.push_str(&format!(
         "third_party_models_count: {}\n",
-        CONFIG.iter_third_party_models().len()
+        runtime_model_count()
     ));
     report.push_str(&format!(
         "web_search_enabled: {}\n",
@@ -519,6 +594,10 @@ async fn build_diagnose_report(state: &AppState) -> String {
         bool_label(!CONFIG.nvidia_api_key.trim().is_empty())
     ));
     report.push_str(&format!(
+        "OPENAI_API_KEY_present: {}\n",
+        bool_label(!CONFIG.openai_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
         "JINA_AI_API_KEY_present: {}\n",
         bool_label(!CONFIG.jina_ai_api_key.trim().is_empty())
     ));
@@ -529,6 +608,14 @@ async fn build_diagnose_report(state: &AppState) -> String {
     report.push_str(&format!(
         "EXA_API_KEY_present: {}\n",
         bool_label(!CONFIG.exa_api_key.trim().is_empty())
+    ));
+    report.push_str(&format!(
+        "OPENAI_CODEX_AUTH_FILE_present: {}\n",
+        bool_label(Path::new(&CONFIG.openai_codex_auth_path).exists())
+    ));
+    report.push_str(&format!(
+        "OPENAI_CODEX_MODEL_FILE_present: {}\n",
+        bool_label(Path::new(&CONFIG.openai_codex_model_path).exists())
     ));
 
     append_log_tail(
@@ -2450,6 +2537,18 @@ pub async fn help_handler(bot: Bot, message: Message) -> Result<()> {
 用法：`/support`
 
 /help - 查看这份帮助说明
+/codexlogin - log in to ChatGPT Codex (admin only)
+Usage: `/codexlogin`
+
+/codexlogout - log out from ChatGPT Codex (admin only)
+Usage: `/codexlogout`
+
+/codexmodel - choose the active Codex model (admin only)
+Usage: `/codexmodel`
+
+/codexreasoning - choose the active Codex reasoning level (admin only)
+Usage: `/codexreasoning`
+
 "#;
 
     bot.send_message(message.chat.id, help_text)

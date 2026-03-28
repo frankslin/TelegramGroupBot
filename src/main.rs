@@ -19,6 +19,10 @@ mod utils;
 
 use config::CONFIG;
 use db::database::Database;
+use handlers::codex_admin::{
+    CODEX_MODEL_PAGE_CALLBACK_PREFIX, CODEX_MODEL_SELECT_CALLBACK_PREFIX,
+    CODEX_REASONING_SELECT_CALLBACK_PREFIX,
+};
 use handlers::qa::MODEL_CALLBACK_PREFIX;
 use handlers::{commands, qa};
 use state::AppState;
@@ -71,6 +75,14 @@ enum Command {
     #[command(description = "查看诊断信息（管理员）")]
     Diagnose,
     #[command(description = "投喂AI小喵")]
+    #[command(description = "ç™»å½• ChatGPT Codexï¼ˆç®¡ç†å‘˜ï¼‰")]
+    Codexlogin,
+    #[command(description = "é€€å‡º ChatGPT Codexï¼ˆç®¡ç†å‘˜ï¼‰")]
+    Codexlogout,
+    #[command(description = "é€‰æ‹©å½“å‰ Codex æ¨¡åž‹ï¼ˆç®¡ç†å‘˜ï¼‰")]
+    Codexmodel,
+    #[command(description = "set Codex reasoning level (admin)")]
+    Codexreasoning,
     Support,
 }
 
@@ -449,6 +461,53 @@ async fn handle_command(
                 }
             });
         }
+        Command::Codexlogin => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) = handlers::codex_admin::codex_login_handler(bot, state, message).await
+                {
+                    error!("codexlogin handler failed: {err}");
+                }
+            });
+        }
+        Command::Codexlogout => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    handlers::codex_admin::codex_logout_handler(bot, state, message).await
+                {
+                    error!("codexlogout handler failed: {err}");
+                }
+            });
+        }
+        Command::Codexmodel => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    handlers::codex_admin::codex_model_handler(bot, state, message).await
+                {
+                    error!("codexmodel handler failed: {err}");
+                }
+            });
+        }
+        Command::Codexreasoning => {
+            let bot = bot.clone();
+            let state = state.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    handlers::codex_admin::codex_reasoning_handler(bot, state, message).await
+                {
+                    error!("codexreasoning handler failed: {err}");
+                }
+            });
+        }
         Command::Support => commands::support_handler(bot, message).await?,
     }
     Ok(())
@@ -464,6 +523,20 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
         tokio::spawn(async move {
             if let Err(err) = qa::model_selection_callback(bot, state, query).await {
                 error!("model selection callback failed: {err}");
+            }
+        });
+        return Ok(());
+    }
+    if data.starts_with(CODEX_MODEL_SELECT_CALLBACK_PREFIX)
+        || data.starts_with(CODEX_MODEL_PAGE_CALLBACK_PREFIX)
+        || data.starts_with(CODEX_REASONING_SELECT_CALLBACK_PREFIX)
+    {
+        let bot = bot.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handlers::codex_admin::codex_admin_callback(bot, state, query).await
+            {
+                error!("codex admin callback failed: {err}");
             }
         });
         return Ok(());

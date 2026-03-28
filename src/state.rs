@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use parking_lot::Mutex;
 use teloxide::types::{FileId, MediaGroupId};
 
 use crate::db::database::Database;
+use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexRemoteModel};
 use crate::llm::media::MediaFile;
 use crate::utils::timing::CommandTimer;
 
@@ -59,6 +61,39 @@ pub struct PendingImageRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingCodexModelRequest {
+    pub admin_user_id: i64,
+    pub chat_id: i64,
+    pub selection_message_id: i64,
+    pub timestamp: i64,
+    pub page: usize,
+    pub etag: Option<String>,
+    pub models: Vec<CodexRemoteModel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingCodexReasoningRequest {
+    pub admin_user_id: i64,
+    pub chat_id: i64,
+    pub selection_message_id: i64,
+    pub timestamp: i64,
+    pub selected_level: Option<String>,
+    pub default_level: Option<String>,
+    pub supported_levels: Vec<CodexReasoningEffortOption>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveCodexLogin {
+    pub admin_user_id: i64,
+    pub chat_id: i64,
+    pub status_message_id: i64,
+    pub verification_url: String,
+    pub user_code: String,
+    pub started_at: i64,
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
 pub struct MediaGroupItem {
     pub file_id: FileId,
 }
@@ -70,6 +105,10 @@ pub struct AppState {
     pub bot_username_lower: String,
     pub pending_q_requests: Arc<Mutex<HashMap<String, PendingQRequest>>>,
     pub pending_image_requests: Arc<Mutex<HashMap<String, PendingImageRequest>>>,
+    pub pending_codex_model_requests: Arc<Mutex<HashMap<String, PendingCodexModelRequest>>>,
+    pub pending_codex_reasoning_requests:
+        Arc<Mutex<HashMap<String, PendingCodexReasoningRequest>>>,
+    pub active_codex_login: Arc<Mutex<Option<ActiveCodexLogin>>>,
     pub media_groups: Arc<Mutex<HashMap<MediaGroupId, Vec<MediaGroupItem>>>>,
 }
 
@@ -81,6 +120,9 @@ impl AppState {
             bot_username_lower,
             pending_q_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_image_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_codex_model_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_codex_reasoning_requests: Arc::new(Mutex::new(HashMap::new())),
+            active_codex_login: Arc::new(Mutex::new(None)),
             media_groups: Arc::new(Mutex::new(HashMap::new())),
         }
     }

@@ -5,7 +5,7 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 ## What it does
 - Stores chat history in SQLite for summaries and profiling.
 - Provides group-friendly commands for summaries, fact checks, Q and A, and media generation.
-- Uses Gemini by default with optional third-party hosted models (OpenRouter and NVIDIA) plus search integrations.
+- Uses Gemini by default with optional third-party hosted models (OpenRouter, NVIDIA, OpenAI Responses, and ChatGPT-backed OpenAI Codex) plus search integrations.
 - Extracts content from Telegraph and Twitter links and can upload images to CWD.PW.
 - Writes text logs to `logs/bot.log` and `logs/timing.log`.
 - Writes structured JSON logs to `logs/bot.jsonl` and `logs/timing.jsonl`.
@@ -27,6 +27,10 @@ A Rust rewrite of TelegramGroupHelperBot focused on performance and lower resour
 - `/portraitme` - Create a portrait prompt based on your history.
 - `/status` - Show a health snapshot (admin-only via whitelist).
 - `/diagnose` - Show extended diagnostics and recent log tails (admin-only via whitelist).
+- `/codexlogin` - Start ChatGPT Codex device-code login (admin-only via whitelist).
+- `/codexlogout` - Remove cached ChatGPT Codex credentials (admin-only via whitelist).
+- `/codexmodel` - Fetch the live Codex model catalog and choose the active Codex model (admin-only via whitelist).
+- `/codexreasoning` - Choose the active Codex reasoning level supported by the selected Codex model (admin-only via whitelist).
 - `/support` - Show support message and link.
 - `/help` - Show command help.
 
@@ -130,6 +134,22 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `NVIDIA_TOP_K` - Stored for config symmetry; not sent to hosted NVIDIA chat requests unless NVIDIA documents support.
 - `NVIDIA_TOP_P` - Default: `0.95`.
 - NVIDIA hosted chat completions are integrated through their OpenAI-compatible endpoint.
+
+### OpenAI Responses (optional)
+- `ENABLE_OPENAI` - Enable the public OpenAI Responses API provider. Default: `false`.
+- `OPENAI_API_KEY` - OpenAI API key used for billed fallback models.
+- `OPENAI_BASE_URL` - Default: `https://api.openai.com/v1`.
+
+### OpenAI Codex via ChatGPT (optional)
+- `ENABLE_OPENAI_CODEX` - Enable ChatGPT-backed Codex support. Default: `true`.
+- `OPENAI_CODEX_BASE_URL` - Default: `https://chatgpt.com/backend-api/codex`.
+- `OPENAI_CODEX_ORIGINATOR` - Request originator header. Default: `codex_cli_rs`.
+- `OPENAI_CODEX_CLIENT_VERSION` - Codex model-catalog compatibility version sent to `/models`. Default: `0.99.0`.
+- `OPENAI_CODEX_AUTH_PATH` - Local auth cache path. Default: `data/openai_codex_auth.json`.
+- `OPENAI_CODEX_MODEL_PATH` - Local selected-model cache path. Default: `data/openai_codex_model.json`.
+- Login is managed with `/codexlogin` and `/codexlogout`.
+- The active Codex model is selected live with `/codexmodel` and exposed in the bot as the runtime alias `openai-codex:selected`.
+- The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
 
 Legacy OpenRouter model variables (used if JSON is missing):
 - `LLAMA_MODEL`
