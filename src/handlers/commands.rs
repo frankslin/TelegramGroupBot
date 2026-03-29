@@ -1649,25 +1649,7 @@ pub async fn tldr_handler(
         return Ok(());
     }
 
-    let label_map = super::build_display_label_map(messages.iter().filter_map(|m| {
-        m.user_id
-            .map(|uid| (uid, m.username.as_deref().unwrap_or("Anonymous")))
-    }));
-    let mut chat_content = String::new();
-    for msg in messages {
-        let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
-        let username = msg
-            .user_id
-            .and_then(|uid| label_map.get(&uid).cloned())
-            // Fallback for messages without a user_id (e.g. channel posts).
-            .unwrap_or_else(|| {
-                msg.username
-                    .clone()
-                    .unwrap_or_else(|| "Anonymous".to_string())
-            });
-        let text = msg.text.unwrap_or_default();
-        chat_content.push_str(&format!("{} {}: {}\n", timestamp, username, text));
-    }
+    let chat_content = super::format_tldr_chat_content(&messages);
 
     let system_prompt = TLDR_SYSTEM_PROMPT.replace("{bot_name}", &CONFIG.telegraph_author_name);
     let response = match call_gemini(

@@ -1304,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn display_labels_disambiguate_same_name_users_in_chat() {
-        use crate::handlers::build_display_label_map;
+        use crate::handlers::{build_display_label_map, format_tldr_chat_content};
 
         let db = init_test_db("disambiguate-names").await;
         let chat = -1001374348669_i64;
@@ -1332,23 +1332,10 @@ mod tests {
         // Alice is unique — no suffix.
         assert_eq!(label_map[&1003], "Alice");
 
-        // Simulate TLDR-style formatting.
-        let mut chat_content = String::new();
-        for msg in &messages {
-            let username = msg
-                .user_id
-                .and_then(|uid| label_map.get(&uid).cloned())
-                .unwrap_or_else(|| {
-                    msg.username
-                        .clone()
-                        .unwrap_or_else(|| "Anonymous".to_string())
-                });
-            let text = msg.text.as_deref().unwrap_or_default();
-            chat_content.push_str(&format!("{}: {}\n", username, text));
-        }
+        let chat_content = format_tldr_chat_content(&messages);
 
-        assert!(chat_content.contains("John (1): Hello from first John"));
-        assert!(chat_content.contains("John (2): Hello from second John"));
-        assert!(chat_content.contains("Alice: Hello from Alice"));
+        assert!(chat_content.contains("[message_id=1] John (1): Hello from first John"));
+        assert!(chat_content.contains("[message_id=2] John (2): Hello from second John"));
+        assert!(chat_content.contains("[message_id=3] Alice: Hello from Alice"));
     }
 }

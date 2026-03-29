@@ -61,9 +61,45 @@ pub fn build_display_label_map<'a>(
     label_map
 }
 
+pub fn format_tldr_chat_content(messages: &[crate::db::models::MessageRow]) -> String {
+    let label_map = build_display_label_map(messages.iter().filter_map(|m| {
+        m.user_id
+            .map(|uid| (uid, m.username.as_deref().unwrap_or("Anonymous")))
+    }));
+
+    let mut chat_content = String::new();
+    for msg in messages {
+        let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
+        let username = msg
+            .user_id
+            .and_then(|uid| label_map.get(&uid).cloned())
+            // Fallback for messages without a user_id (e.g. channel posts).
+            .unwrap_or_else(|| {
+                msg.username
+                    .clone()
+                    .unwrap_or_else(|| "Anonymous".to_string())
+            });
+        let text = msg.text.as_deref().unwrap_or_default();
+        let reply_context = msg
+            .reply_to_message_id
+            .map(|reply_to| format!(" reply_to_message_id={reply_to}"))
+            .unwrap_or_default();
+
+        chat_content.push_str(&format!(
+            "{} [message_id={}{}] {}: {}\n",
+            timestamp, msg.message_id, reply_context, username, text
+        ));
+    }
+
+    chat_content
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+
+    use crate::db::models::MessageRow;
 
     #[test]
     fn unique_names_are_unchanged() {
@@ -161,5 +197,52 @@ mod tests {
         assert_eq!(map_a[&10], "X (1)");
         assert_eq!(map_a[&30], "X (2)");
         assert_eq!(map_a[&50], "X (3)");
+    }
+
+    #[test]
+    fn tldr_format_includes_message_and_reply_context() {
+        let messages = vec![
+            MessageRow {
+                id: 1,
+                message_id: 10,
+                chat_id: -100,
+                user_id: Some(1),
+                username: Some("Alice".to_string()),
+                text: Some("Root message".to_string()),
+                language: Some("en".to_string()),
+                date: Utc
+                    .with_ymd_and_hms(2026, 3, 29, 12, 0, 0)
+                    .single()
+                    .unwrap(),
+                reply_to_message_id: None,
+                asks_ai: false,
+                ai_command: None,
+                is_synthetic_record: false,
+            },
+            MessageRow {
+                id: 2,
+                message_id: 11,
+                chat_id: -100,
+                user_id: Some(2),
+                username: Some("Bob".to_string()),
+                text: Some("Reply message".to_string()),
+                language: Some("en".to_string()),
+                date: Utc
+                    .with_ymd_and_hms(2026, 3, 29, 12, 1, 0)
+                    .single()
+                    .unwrap(),
+                reply_to_message_id: Some(10),
+                asks_ai: false,
+                ai_command: None,
+                is_synthetic_record: false,
+            },
+        ];
+
+        let content = format_tldr_chat_content(&messages);
+
+        assert!(content.contains("2026-03-29 12:00:00 [message_id=10] Alice: Root message"));
+        assert!(content.contains(
+            "2026-03-29 12:01:00 [message_id=11 reply_to_message_id=10] Bob: Reply message"
+        ));
     }
 }
