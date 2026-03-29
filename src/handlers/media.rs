@@ -104,6 +104,7 @@ fn extension_mime_hint(file_name: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn add_file_from_file_id(
     bot: &Bot,
     file_id: &FileId,

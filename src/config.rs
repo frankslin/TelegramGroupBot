@@ -280,7 +280,8 @@ fn resolve_third_party_models_path() -> PathBuf {
             candidates.push(env_path);
         } else {
             candidates.push(
-                PathBuf::from(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
                     .join(env_path),
             );
         }
@@ -295,7 +296,7 @@ fn resolve_third_party_models_path() -> PathBuf {
     }
 
     candidates
-        .get(0)
+        .first()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("third_party_models.json"))
 }
@@ -763,6 +764,7 @@ You must output a single valid JSON object.
 Return ONLY the raw JSON string."#;
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

@@ -182,7 +182,7 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
                             ));
                         } else {
                             current_text.push_str(&process_nodes(
-                                &[child.clone()],
+                                std::slice::from_ref(child),
                                 content,
                                 image_counter,
                                 video_counter,
@@ -208,7 +208,7 @@ pub async fn extract_telegraph_content(url: &str) -> Result<TelegraphContent> {
                             ));
                         } else {
                             code_block.push_str(&process_nodes(
-                                &[child.clone()],
+                                std::slice::from_ref(child),
                                 content,
                                 image_counter,
                                 video_counter,

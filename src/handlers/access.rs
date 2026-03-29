@@ -126,6 +126,7 @@ pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::normalize_command_name;
 

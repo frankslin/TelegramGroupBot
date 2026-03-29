@@ -247,6 +247,7 @@ fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<Str
     ];
     let video_extensions = [".mp4", ".m3u8", ".mpd"];
     let punct_prefixes = [".", ",", ";", ":", ")", "]", "}", "!", "?"];
+    let whitespace_pattern = Regex::new(r"\s+").unwrap();
 
     for line in lines {
         let mut working = line.clone();
@@ -338,8 +339,7 @@ fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<Str
                 caps[1].trim().to_string()
             })
             .to_string();
-        working = Regex::new(r"\s+")
-            .unwrap()
+        working = whitespace_pattern
             .replace_all(&working, " ")
             .trim()
             .to_string();
@@ -395,10 +395,8 @@ fn extract_metadata(cleaned_lines: &[String]) -> (Option<String>, Option<String>
 
 fn strip_indices(lines: &[String], indexes: &[Option<usize>]) -> Vec<String> {
     let mut skip = HashSet::new();
-    for idx in indexes {
-        if let Some(value) = idx {
-            skip.insert(*value);
-        }
+    for value in indexes.iter().flatten() {
+        skip.insert(*value);
     }
     lines
         .iter()

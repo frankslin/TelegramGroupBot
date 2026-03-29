@@ -555,14 +555,14 @@ fn third_party_model_matches_request_capabilities(
     true
 }
 
-fn available_third_party_models_for_request<'a>(
-    models: &'a [ThirdPartyModelConfig],
+fn available_third_party_models_for_request(
+    models: &[ThirdPartyModelConfig],
     has_images: bool,
     has_video: bool,
     has_audio: bool,
     has_documents: bool,
     require_tools: bool,
-) -> Vec<&'a ThirdPartyModelConfig> {
+) -> Vec<&ThirdPartyModelConfig> {
     models
         .iter()
         .filter(|config| is_third_party_model_available(config))
@@ -1023,6 +1023,7 @@ async fn process_request(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1047,7 +1048,7 @@ mod tests {
             "openrouter/no-tools",
         );
         without_tools.tools = false;
-        let models = vec![
+        let models = [
             model(
                 ThirdPartyProvider::OpenRouter,
                 "With Tools",
@@ -1937,9 +1938,6 @@ pub async fn model_selection_callback(
         complete_command_timer(&mut timer, status, None);
     }
 
-    if let Err(err) = result {
-        return Err(err);
-    }
-
+    result?;
     Ok(())
 }

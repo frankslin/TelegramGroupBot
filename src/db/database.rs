@@ -899,6 +899,7 @@ async fn db_writer(pool: SqlitePool, mut receiver: mpsc::Receiver<MessageInsert>
     info!("Database writer task stopped");
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_message_insert(
     user_id: Option<i64>,
     username: Option<String>,

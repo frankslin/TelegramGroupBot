@@ -110,8 +110,8 @@ struct MysongLanguageSelection {
 }
 
 fn strip_command_prefix(text: &str, command_prefix: &str) -> String {
-    if text.starts_with(command_prefix) {
-        text[command_prefix.len()..].trim().to_string()
+    if let Some(stripped) = text.strip_prefix(command_prefix) {
+        stripped.trim().to_string()
     } else {
         text.to_string()
     }
@@ -2294,11 +2294,7 @@ pub async fn mysong_handler(
             processing_message.id,
             "Lyria song generation",
             "Generating your song failed, retrying ({attempt}/{max})...",
-            || async {
-                generate_music_with_lyria(&lyria_prompt)
-                    .await
-                    .map_err(Into::into)
-            },
+            || async { generate_music_with_lyria(&lyria_prompt).await },
         )
         .await?;
 
