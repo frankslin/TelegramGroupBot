@@ -686,10 +686,6 @@ impl Config {
         })
     }
 
-    pub fn iter_third_party_models(&self) -> &[ThirdPartyModelConfig] {
-        &self.third_party_models
-    }
-
     pub fn get_third_party_model_config(&self, model_id: &str) -> Option<&ThirdPartyModelConfig> {
         self.third_party_models_by_id.get(model_id)
     }

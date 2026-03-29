@@ -622,6 +622,18 @@ async fn upload_media_files(files: &[MediaFile]) -> Result<Vec<UploadedFileRef>>
         };
         let info = upload_file_bytes(&display_name, &mime_type, &file.bytes).await?;
         let info = wait_for_file_active(info).await?;
+        if let Some(uploaded_mime_type) = info
+            .mime_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            debug!(
+                display_name = %display_name,
+                mime_type = %uploaded_mime_type,
+                "Gemini file upload became active"
+            );
+        }
         let uri = if !info.uri.trim().is_empty() {
             info.uri
         } else if !info.name.trim().is_empty() {
@@ -755,6 +767,14 @@ fn extract_text_from_response(response: GeminiResponse) -> String {
                             }
                         }
                         GeminiPart::ExecutableCode { executable_code } => {
+                            if let Some(language) = executable_code
+                                .language
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                            {
+                                debug!(%language, "Gemini response included executable code");
+                            }
                             if let Some(code) = executable_code.code.as_deref() {
                                 if !code.trim().is_empty() {
                                     fallback_parts.push(code.to_string());
@@ -764,6 +784,14 @@ fn extract_text_from_response(response: GeminiResponse) -> String {
                         GeminiPart::CodeExecutionResult {
                             code_execution_result,
                         } => {
+                            if let Some(outcome) = code_execution_result
+                                .outcome
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                            {
+                                debug!(%outcome, "Gemini response included code execution result");
+                            }
                             if let Some(output) = code_execution_result.output.as_deref() {
                                 if !output.trim().is_empty() {
                                     fallback_parts.push(output.to_string());

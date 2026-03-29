@@ -1314,7 +1314,10 @@ mod tests {
         // A third user with a unique name.
         queue_message_with_user(&db, 3, chat, 1003, "Alice", "Hello from Alice").await;
 
-        let messages = db.select_messages(chat, 10).await.expect("select should work");
+        let messages = db
+            .select_messages(chat, 10)
+            .await
+            .expect("select should work");
         assert_eq!(messages.len(), 3);
 
         let label_map = build_display_label_map(messages.iter().filter_map(|m| {
@@ -1335,7 +1338,9 @@ mod tests {
                 .user_id
                 .and_then(|uid| label_map.get(&uid).cloned())
                 .unwrap_or_else(|| {
-                    msg.username.clone().unwrap_or_else(|| "Anonymous".to_string())
+                    msg.username
+                        .clone()
+                        .unwrap_or_else(|| "Anonymous".to_string())
                 });
             let text = msg.text.as_deref().unwrap_or_default();
             chat_content.push_str(&format!("{}: {}\n", username, text));

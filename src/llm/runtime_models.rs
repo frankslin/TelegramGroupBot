@@ -239,17 +239,6 @@ pub fn save_selected_codex_reasoning_level(
     Ok(record)
 }
 
-pub fn clear_selected_codex_model() -> Result<bool> {
-    let path = selected_model_path();
-    let removed = match fs::remove_file(path) {
-        Ok(()) => true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => return Err(err.into()),
-    };
-    reload_runtime_models();
-    Ok(removed)
-}
-
 pub fn is_runtime_provider_ready(provider: ThirdPartyProvider) -> bool {
     match provider {
         ThirdPartyProvider::OpenRouter => {

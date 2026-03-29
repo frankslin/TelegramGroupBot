@@ -48,7 +48,11 @@ pub fn build_display_label_map<'a>(
         let uids = &name_to_uids[name];
         if uids.len() > 1 {
             // Safe: uid is guaranteed to be in uids because we built uids from uid_to_name.
-            let ordinal = uids.iter().position(|id| *id == uid).expect("uid must exist in its own group") + 1;
+            let ordinal = uids
+                .iter()
+                .position(|id| *id == uid)
+                .expect("uid must exist in its own group")
+                + 1;
             label_map.insert(uid, format!("{} ({})", name, ordinal));
         } else {
             label_map.insert(uid, name.to_string());
@@ -125,11 +129,7 @@ mod tests {
     #[test]
     fn duplicate_entries_for_same_user_keeps_last_name() {
         // Simulates a user who changed their display name mid-conversation.
-        let entries = vec![
-            (1, "OldName"),
-            (2, "Bob"),
-            (1, "NewName"),
-        ];
+        let entries = vec![(1, "OldName"), (2, "Bob"), (1, "NewName")];
         let map = build_display_label_map(entries);
         // user_id 1 should use "NewName" (the last entry).
         assert_eq!(map[&1], "NewName");
@@ -139,11 +139,7 @@ mod tests {
     #[test]
     fn name_change_creates_collision() {
         // user 1 was "Alice", then changed to "Bob" — now collides with user 2.
-        let entries = vec![
-            (1, "Alice"),
-            (2, "Bob"),
-            (1, "Bob"),
-        ];
+        let entries = vec![(1, "Alice"), (2, "Bob"), (1, "Bob")];
         let map = build_display_label_map(entries);
         assert_eq!(map[&1], "Bob (1)");
         assert_eq!(map[&2], "Bob (2)");
