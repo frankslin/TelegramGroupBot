@@ -2578,6 +2578,9 @@ Usage: `/codexmodel`
 /codexreasoning - choose the active Codex reasoning level (admin only)
 Usage: `/codexreasoning`
 
+/codexusage - show current Codex usage/rate limits (admin only)
+Usage: `/codexusage`
+
 "#;
 
     bot.send_message(message.chat.id, help_text)

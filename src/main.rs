@@ -83,6 +83,8 @@ enum Command {
     Codexmodel,
     #[command(description = "set Codex reasoning level (admin)")]
     Codexreasoning,
+    #[command(description = "show Codex usage and rate limits (admin)")]
+    Codexusage,
     Support,
 }
 
@@ -506,6 +508,15 @@ async fn handle_command(
                     handlers::codex_admin::codex_reasoning_handler(bot, state, message).await
                 {
                     error!("codexreasoning handler failed: {err}");
+                }
+            });
+        }
+        Command::Codexusage => {
+            let bot = bot.clone();
+            let message = message.clone();
+            tokio::spawn(async move {
+                if let Err(err) = handlers::codex_admin::codex_usage_handler(bot, message).await {
+                    error!("codexusage handler failed: {err}");
                 }
             });
         }

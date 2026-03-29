@@ -140,6 +140,37 @@ pub struct OpenAICodexAuthSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct CodexUsageSnapshot {
+    pub plan_type: Option<String>,
+    pub primary: Option<CodexUsageWindow>,
+    pub secondary: Option<CodexUsageWindow>,
+    pub credits: Option<CodexUsageCredits>,
+    pub additional_limits: Vec<CodexAdditionalUsageLimit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexUsageWindow {
+    pub used_percent: f64,
+    pub limit_window_seconds: Option<i64>,
+    pub reset_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexUsageCredits {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexAdditionalUsageLimit {
+    pub limit_name: String,
+    pub metered_feature: String,
+    pub primary: Option<CodexUsageWindow>,
+    pub secondary: Option<CodexUsageWindow>,
+}
+
+#[derive(Debug, Clone)]
 struct ParsedIdToken {
     email: Option<String>,
     plan_type: Option<String>,
@@ -184,6 +215,53 @@ struct RefreshTokenResponse {
 #[derive(Debug, Deserialize)]
 struct CodexModelsResponse {
     models: Vec<CodexRemoteModel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexUsageResponse {
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<CodexUsageRateLimitDetails>,
+    #[serde(default)]
+    additional_rate_limits: Option<Vec<CodexUsageAdditionalRateLimit>>,
+    #[serde(default)]
+    credits: Option<CodexUsageCreditsDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexUsageRateLimitDetails {
+    #[serde(default)]
+    primary_window: Option<CodexUsageWindowSnapshot>,
+    #[serde(default)]
+    secondary_window: Option<CodexUsageWindowSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexUsageWindowSnapshot {
+    used_percent: f64,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
+    #[serde(default)]
+    reset_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexUsageAdditionalRateLimit {
+    limit_name: String,
+    metered_feature: String,
+    #[serde(default)]
+    rate_limit: Option<CodexUsageRateLimitDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexUsageCreditsDetails {
+    #[serde(default)]
+    has_credits: bool,
+    #[serde(default)]
+    unlimited: bool,
+    #[serde(default)]
+    balance: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,6 +626,21 @@ pub fn codex_response_url() -> String {
     format!("{}/responses", codex_base_url())
 }
 
+fn codex_usage_url_from_base_url(base_url: &str) -> String {
+    let normalized = base_url.trim().trim_end_matches('/');
+    if let Some((prefix, _)) = normalized.split_once("/backend-api") {
+        format!("{prefix}/backend-api/wham/usage")
+    } else if normalized.ends_with("/api/codex") || normalized.ends_with("/codex") {
+        format!("{normalized}/usage")
+    } else {
+        format!("{normalized}/api/codex/usage")
+    }
+}
+
+pub fn codex_usage_url() -> String {
+    codex_usage_url_from_base_url(&codex_base_url())
+}
+
 pub fn native_web_search_mode() -> CodexWebSearchMode {
     CodexWebSearchMode::from_config(&CONFIG.openai_codex_web_search_mode)
 }
@@ -589,6 +682,120 @@ pub fn build_native_web_search_tool_from_record(
     }
 
     Some(tool)
+}
+
+fn map_usage_window(window: Option<CodexUsageWindowSnapshot>) -> Option<CodexUsageWindow> {
+    let window = window?;
+    Some(CodexUsageWindow {
+        used_percent: window.used_percent,
+        limit_window_seconds: window.limit_window_seconds,
+        reset_at: window.reset_at,
+    })
+}
+
+pub async fn fetch_usage_snapshot() -> Result<CodexUsageSnapshot> {
+    let url = codex_usage_url();
+    for attempt in 0..2 {
+        let auth = get_valid_auth_context().await?;
+        info!("Fetching Codex usage snapshot");
+        let response = get_http_client()
+            .get(&url)
+            .headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                for (name, value) in codex_headers(&auth, None) {
+                    headers.insert(
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
+                        reqwest::header::HeaderValue::from_str(&value)?,
+                    );
+                }
+                headers
+            })
+            .send()
+            .await
+            .context("Failed to fetch Codex usage snapshot")?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            warn!("Codex usage request unauthorized; refreshing auth and retrying");
+            let _ = force_refresh_auth_tokens().await?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            error!(
+                "Codex usage request failed: status={}, body={}",
+                status,
+                summarize_error_body(&body)
+            );
+            return Err(anyhow!(
+                "Codex usage request failed with status {}: {}",
+                status,
+                body
+            ));
+        }
+
+        let body = response
+            .text()
+            .await
+            .context("Failed to read Codex usage response body")?;
+        let payload = match serde_json::from_str::<CodexUsageResponse>(&body) {
+            Ok(payload) => payload,
+            Err(err) => {
+                error!(
+                    "Failed to parse Codex usage response: body={}",
+                    summarize_error_body(&body)
+                );
+                return Err(anyhow!("Failed to parse Codex usage response: {}", err));
+            }
+        };
+
+        info!(
+            "Fetched Codex usage snapshot successfully: plan_type={}",
+            payload.plan_type.as_deref().unwrap_or("unknown")
+        );
+
+        let primary = payload
+            .rate_limit
+            .as_ref()
+            .and_then(|details| map_usage_window(details.primary_window.clone()));
+        let secondary = payload
+            .rate_limit
+            .as_ref()
+            .and_then(|details| map_usage_window(details.secondary_window.clone()));
+        let credits = payload.credits.map(|credits| CodexUsageCredits {
+            has_credits: credits.has_credits,
+            unlimited: credits.unlimited,
+            balance: credits.balance,
+        });
+        let additional_limits = payload
+            .additional_rate_limits
+            .unwrap_or_default()
+            .into_iter()
+            .map(|limit| CodexAdditionalUsageLimit {
+                limit_name: limit.limit_name,
+                metered_feature: limit.metered_feature,
+                primary: limit
+                    .rate_limit
+                    .as_ref()
+                    .and_then(|details| map_usage_window(details.primary_window.clone())),
+                secondary: limit
+                    .rate_limit
+                    .as_ref()
+                    .and_then(|details| map_usage_window(details.secondary_window.clone())),
+            })
+            .collect::<Vec<_>>();
+
+        return Ok(CodexUsageSnapshot {
+            plan_type: payload.plan_type,
+            primary,
+            secondary,
+            credits,
+            additional_limits,
+        });
+    }
+
+    Err(anyhow!("Codex usage request failed after refresh retry"))
 }
 
 pub async fn fetch_models() -> Result<CodexModelList> {
@@ -889,5 +1096,60 @@ mod tests {
         assert_eq!(tool["filters"]["allowed_domains"][0], "example.com");
         assert_eq!(tool["search_content_types"][0], "text");
         assert_eq!(tool["search_content_types"][1], "image");
+    }
+
+    #[test]
+    fn codex_usage_url_uses_wham_for_chatgpt_backend_api() {
+        assert_eq!(
+            codex_usage_url_from_base_url("https://chatgpt.com/backend-api/codex"),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+    }
+
+    #[test]
+    fn codex_usage_url_uses_codex_api_path_for_codex_api_bases() {
+        assert_eq!(
+            codex_usage_url_from_base_url("https://example.com/api/codex"),
+            "https://example.com/api/codex/usage"
+        );
+    }
+
+    #[test]
+    fn codex_usage_response_accepts_null_additional_rate_limits() {
+        let raw = r#"{
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 66,
+                    "limit_window_seconds": 18000,
+                    "reset_at": 1774771659
+                },
+                "secondary_window": {
+                    "used_percent": 45,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1775181504
+                }
+            },
+            "additional_rate_limits": null,
+            "credits": {
+                "has_credits": false,
+                "unlimited": false,
+                "balance": "0"
+            }
+        }"#;
+
+        let parsed: CodexUsageResponse =
+            serde_json::from_str(raw).expect("usage response should parse");
+
+        assert_eq!(parsed.plan_type.as_deref(), Some("plus"));
+        assert!(parsed.additional_rate_limits.is_none());
+        assert_eq!(
+            parsed
+                .rate_limit
+                .as_ref()
+                .and_then(|details| details.primary_window.as_ref())
+                .map(|window| window.used_percent),
+            Some(66.0)
+        );
     }
 }

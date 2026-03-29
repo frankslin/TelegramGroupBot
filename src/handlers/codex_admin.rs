@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ReplyParameters};
 
@@ -188,6 +188,116 @@ fn build_reasoning_selection_keyboard(
         format!("{}default", CODEX_REASONING_SELECT_CALLBACK_PREFIX),
     )]);
     InlineKeyboardMarkup::new(rows)
+}
+
+fn format_usage_percent(value: f64) -> String {
+    let rounded = value.round();
+    if (value - rounded).abs() < 0.05 {
+        format!("{rounded:.0}%")
+    } else {
+        format!("{value:.1}%")
+    }
+}
+
+fn format_usage_window_duration(limit_window_seconds: Option<i64>, fallback: &str) -> String {
+    let Some(seconds) = limit_window_seconds else {
+        return fallback.to_string();
+    };
+    if seconds % 86_400 == 0 {
+        return format!("{}d", seconds / 86_400);
+    }
+    if seconds % 3_600 == 0 {
+        return format!("{}h", seconds / 3_600);
+    }
+    if seconds % 60 == 0 {
+        return format!("{}m", seconds / 60);
+    }
+    format!("{seconds}s")
+}
+
+fn format_usage_reset_at(reset_at: Option<i64>) -> String {
+    reset_at
+        .and_then(|timestamp| chrono::DateTime::<Utc>::from_timestamp(timestamp, 0))
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn append_usage_window(
+    lines: &mut Vec<String>,
+    label: &str,
+    window: &openai_codex::CodexUsageWindow,
+    fallback_duration: &str,
+) {
+    lines.push(format!(
+        "{} ({}): {} used, resets {}",
+        label,
+        format_usage_window_duration(window.limit_window_seconds, fallback_duration),
+        format_usage_percent(window.used_percent),
+        format_usage_reset_at(window.reset_at)
+    ));
+}
+
+fn build_usage_report(snapshot: &openai_codex::CodexUsageSnapshot) -> String {
+    let mut lines = vec!["Codex usage".to_string()];
+
+    if let Some(plan_type) = snapshot.plan_type.as_deref() {
+        lines.push(format!("Plan: {plan_type}"));
+    }
+
+    if let Some(primary) = snapshot.primary.as_ref() {
+        append_usage_window(&mut lines, "Primary window", primary, "5h");
+    }
+    if let Some(secondary) = snapshot.secondary.as_ref() {
+        append_usage_window(&mut lines, "Secondary window", secondary, "weekly");
+    }
+
+    if let Some(credits) = snapshot.credits.as_ref() {
+        let balance = credits.balance.as_deref().unwrap_or("unknown");
+        lines.push(format!(
+            "Credits: enabled={}, unlimited={}, balance={}",
+            credits.has_credits, credits.unlimited, balance
+        ));
+    }
+
+    if !snapshot.additional_limits.is_empty() {
+        lines.push(String::new());
+        lines.push("Additional limits:".to_string());
+        for limit in &snapshot.additional_limits {
+            lines.push(format!(
+                "- {} ({})",
+                limit.limit_name, limit.metered_feature
+            ));
+            if let Some(primary) = limit.primary.as_ref() {
+                lines.push(format!(
+                    "  primary ({}): {} used, resets {}",
+                    format_usage_window_duration(primary.limit_window_seconds, "5h"),
+                    format_usage_percent(primary.used_percent),
+                    format_usage_reset_at(primary.reset_at)
+                ));
+            }
+            if let Some(secondary) = limit.secondary.as_ref() {
+                lines.push(format!(
+                    "  secondary ({}): {} used, resets {}",
+                    format_usage_window_duration(secondary.limit_window_seconds, "weekly"),
+                    format_usage_percent(secondary.used_percent),
+                    format_usage_reset_at(secondary.reset_at)
+                ));
+            }
+        }
+    }
+
+    if lines.len() == 1 {
+        lines.push("No Codex usage details were returned.".to_string());
+    }
+
+    lines.push(String::new());
+    lines.push("Reference: https://chatgpt.com/codex/settings/usage".to_string());
+    lines.join("\n")
 }
 
 async fn handle_model_selection_timeout(bot: Bot, state: AppState, request_id: String) {
@@ -490,6 +600,28 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
             .await;
     });
 
+    Ok(())
+}
+
+pub async fn codex_usage_handler(bot: Bot, message: Message) -> Result<()> {
+    if !check_admin_access(&bot, &message, "codexusage").await {
+        return Ok(());
+    }
+
+    if !openai_codex::is_auth_ready() {
+        bot.send_message(
+            message.chat.id,
+            "Codex is not logged in yet. Run /codexlogin first.",
+        )
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
+        return Ok(());
+    }
+
+    let snapshot = openai_codex::fetch_usage_snapshot().await?;
+    bot.send_message(message.chat.id, build_usage_report(&snapshot))
+        .reply_parameters(ReplyParameters::new(message.id))
+        .await?;
     Ok(())
 }
 
