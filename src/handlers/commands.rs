@@ -1659,6 +1659,7 @@ pub async fn tldr_handler(
         let username = msg
             .user_id
             .and_then(|uid| label_map.get(&uid).cloned())
+            // Fallback for messages without a user_id (e.g. channel posts).
             .unwrap_or_else(|| {
                 msg.username.clone().unwrap_or_else(|| "Anonymous".to_string())
             });

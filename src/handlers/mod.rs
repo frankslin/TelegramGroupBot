@@ -47,7 +47,8 @@ pub fn build_display_label_map<'a>(
     for (&uid, &name) in &uid_to_name {
         let uids = &name_to_uids[name];
         if uids.len() > 1 {
-            let ordinal = uids.iter().position(|id| *id == uid).unwrap() + 1;
+            // Safe: uid is guaranteed to be in uids because we built uids from uid_to_name.
+            let ordinal = uids.iter().position(|id| *id == uid).expect("uid must exist in its own group") + 1;
             label_map.insert(uid, format!("{} ({})", name, ordinal));
         } else {
             label_map.insert(uid, name.to_string());
