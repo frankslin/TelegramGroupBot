@@ -417,6 +417,12 @@ async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAu
     Ok(updated)
 }
 
+pub async fn force_refresh_auth_tokens() -> Result<OpenAICodexAuthFile> {
+    let _guard = TOKEN_REFRESH_LOCK.lock().await;
+    let auth = load_auth_file_internal()?.ok_or_else(|| anyhow!("Codex is not logged in"))?;
+    refresh_auth_tokens(&auth).await
+}
+
 pub async fn get_valid_auth_context() -> Result<OpenAICodexAuthContext> {
     let _guard = TOKEN_REFRESH_LOCK.lock().await;
     let mut auth = load_auth_file_internal()?.ok_or_else(|| anyhow!("Codex is not logged in"))?;
@@ -472,54 +478,63 @@ pub fn codex_response_url() -> String {
 }
 
 pub async fn fetch_models() -> Result<CodexModelList> {
-    let auth = get_valid_auth_context().await?;
     let version = if CONFIG.openai_codex_client_version.trim().is_empty() {
         "0.99.0"
     } else {
         CONFIG.openai_codex_client_version.trim()
     };
-    info!("Fetching Codex model catalog with client_version={version}");
-    let response = get_http_client()
-        .get(format!("{}/models", codex_base_url()))
-        .query(&[("client_version", version)])
-        .headers({
-            let mut headers = reqwest::header::HeaderMap::new();
-            for (name, value) in codex_headers(&auth, None) {
-                headers.insert(
-                    reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
-                    reqwest::header::HeaderValue::from_str(&value)?,
-                );
-            }
-            headers
-        })
-        .send()
-        .await
-        .context("Failed to fetch Codex models")?;
+    for attempt in 0..2 {
+        let auth = get_valid_auth_context().await?;
+        info!("Fetching Codex model catalog with client_version={version}");
+        let response = get_http_client()
+            .get(format!("{}/models", codex_base_url()))
+            .query(&[("client_version", version)])
+            .headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                for (name, value) in codex_headers(&auth, None) {
+                    headers.insert(
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
+                        reqwest::header::HeaderValue::from_str(&value)?,
+                    );
+                }
+                headers
+            })
+            .send()
+            .await
+            .context("Failed to fetch Codex models")?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Codex models request failed with status {}: {}",
-            status,
-            body
-        ));
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            let _ = force_refresh_auth_tokens().await?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Codex models request failed with status {}: {}",
+                status,
+                body
+            ));
+        }
+
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let payload = response
+            .json::<CodexModelsResponse>()
+            .await
+            .context("Failed to parse Codex models response")?;
+
+        return Ok(CodexModelList {
+            models: payload.models,
+            etag,
+        });
     }
 
-    let etag = response
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
-    let payload = response
-        .json::<CodexModelsResponse>()
-        .await
-        .context("Failed to parse Codex models response")?;
-
-    Ok(CodexModelList {
-        models: payload.models,
-        etag,
-    })
+    Err(anyhow!("Codex models request failed after refresh retry"))
 }
 
 pub async fn request_device_code() -> Result<DeviceCodeStart> {

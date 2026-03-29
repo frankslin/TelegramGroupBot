@@ -25,6 +25,7 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 struct ResponsesRequestDetails {
+    provider: ThirdPartyProvider,
     display_name: &'static str,
     url: String,
     headers: Vec<(String, String)>,
@@ -253,6 +254,7 @@ async fn build_request_details(
     }
 
     Ok(ResponsesRequestDetails {
+        provider: model_config.provider,
         display_name,
         url,
         headers,
@@ -356,6 +358,13 @@ async fn call_provider_api(details: &ResponsesRequestDetails) -> Result<Value> {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            if status == StatusCode::UNAUTHORIZED
+                && details.provider == ThirdPartyProvider::OpenAICodex
+                && attempt < RESPONSES_MAX_ATTEMPTS
+            {
+                openai_codex::force_refresh_auth_tokens().await?;
+                continue;
+            }
             let (message, body_summary) = summarize_error_body(&body);
             let should_retry =
                 responses_should_retry_status(status) && attempt < RESPONSES_MAX_ATTEMPTS;
@@ -723,5 +732,31 @@ mod tests {
             responses_base_url("https://chatgpt.com/backend-api/codex/responses"),
             "https://chatgpt.com/backend-api/codex/responses"
         );
+    }
+
+    #[test]
+    fn parse_sse_responses_body_collects_output_items() {
+        let body = r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp1"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"web_search","arguments":"{}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp1","output":[]}}
+"#;
+
+        let parsed = parse_sse_responses_body(body).expect("SSE body should parse");
+        let output = parsed
+            .get("output")
+            .and_then(|value| value.as_array())
+            .expect("output array");
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[1]["type"], "function_call");
     }
 }

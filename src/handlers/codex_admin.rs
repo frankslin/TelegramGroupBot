@@ -450,7 +450,6 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
             chat_id: message.chat.id.0,
             selection_message_id: selection_message.id.0 as i64,
             timestamp: now_unix_seconds(),
-            selected_level: record.selected_reasoning_level.clone(),
             default_level: record.default_reasoning_level.clone(),
             supported_levels: record.supported_reasoning_levels.clone(),
         },

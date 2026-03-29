@@ -77,7 +77,6 @@ pub struct PendingCodexReasoningRequest {
     pub chat_id: i64,
     pub selection_message_id: i64,
     pub timestamp: i64,
-    pub selected_level: Option<String>,
     pub default_level: Option<String>,
     pub supported_levels: Vec<CodexReasoningEffortOption>,
 }

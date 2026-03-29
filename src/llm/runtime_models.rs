@@ -210,10 +210,6 @@ pub fn save_selected_codex_reasoning_level(level: Option<String>) -> Result<Code
     Ok(record)
 }
 
-pub fn current_codex_reasoning_level() -> Option<String> {
-    selected_codex_model_record().and_then(|record| record.selected_reasoning_level)
-}
-
 pub fn clear_selected_codex_model() -> Result<bool> {
     let path = selected_model_path();
     let removed = match fs::remove_file(path) {
