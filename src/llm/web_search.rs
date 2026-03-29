@@ -161,7 +161,7 @@ fn provider_enabled(provider: WebSearchProvider) -> bool {
 pub fn is_search_enabled() -> bool {
     provider_order()
         .into_iter()
-        .any(|provider| provider_enabled(provider))
+        .any(provider_enabled)
 }
 
 async fn search_with_provider(

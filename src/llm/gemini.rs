@@ -1171,6 +1171,7 @@ fn build_function_response_part(function_call: &Value, result_json: &str) -> Val
     json!({ "functionResponse": function_response })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn call_gemini_with_tool_runtime(
     system_prompt: &str,
     user_content: &str,
@@ -1354,6 +1355,7 @@ async fn call_gemini_lite_fallback(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn call_gemini(
     system_prompt: &str,
     user_content: &str,

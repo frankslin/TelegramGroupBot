@@ -70,7 +70,7 @@ fn markdown_to_telegraph_nodes(content: &str) -> Vec<serde_json::Value> {
     }
 
     fn push_value(
-        stack: &mut Vec<StackEntry>,
+        stack: &mut [StackEntry],
         root: &mut Vec<serde_json::Value>,
         value: serde_json::Value,
     ) {
@@ -303,22 +303,23 @@ pub async fn create_telegraph_page(title: &str, content: &str) -> Option<String>
 
     let nodes = markdown_to_telegraph_nodes(content);
     let content_json = serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".to_string());
-    let mut form = Vec::new();
-    form.push((
-        "access_token".to_string(),
-        CONFIG.telegraph_access_token.clone(),
-    ));
-    form.push((
-        "author_name".to_string(),
-        CONFIG.telegraph_author_name.clone(),
-    ));
-    form.push((
-        "author_url".to_string(),
-        CONFIG.telegraph_author_url.clone(),
-    ));
-    form.push(("title".to_string(), title.to_string()));
-    form.push(("content".to_string(), content_json));
-    form.push(("return_content".to_string(), "false".to_string()));
+    let form = vec![
+        (
+            "access_token".to_string(),
+            CONFIG.telegraph_access_token.clone(),
+        ),
+        (
+            "author_name".to_string(),
+            CONFIG.telegraph_author_name.clone(),
+        ),
+        (
+            "author_url".to_string(),
+            CONFIG.telegraph_author_url.clone(),
+        ),
+        ("title".to_string(), title.to_string()),
+        ("content".to_string(), content_json),
+        ("return_content".to_string(), "false".to_string()),
+    ];
 
     let client = get_http_client();
     let response = client

@@ -26,7 +26,7 @@ pub fn start_chat_action_heartbeat(
 ) -> ChatActionHeartbeat {
     let task_handle = tokio::spawn(async move {
         loop {
-            if let Err(err) = bot.send_chat_action(chat_id, action.clone()).await {
+            if let Err(err) = bot.send_chat_action(chat_id, action).await {
                 warn!("send_chat_action failed: {err}");
             }
             tokio::time::sleep(CHAT_ACTION_HEARTBEAT_INTERVAL).await;

@@ -280,7 +280,7 @@ fn resolve_third_party_models_path() -> PathBuf {
             candidates.push(env_path);
         } else {
             candidates.push(
-                PathBuf::from(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                     .join(env_path),
             );
         }
@@ -295,7 +295,7 @@ fn resolve_third_party_models_path() -> PathBuf {
     }
 
     candidates
-        .get(0)
+        .first()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("third_party_models.json"))
 }
@@ -762,6 +762,63 @@ You must output a single valid JSON object.
 ### OUTPUT
 Return ONLY the raw JSON string."#;
 
+
+pub const PORTRAIT_SYSTEM_PROMPT: &str = r#"You are a Master Character Designer and Cinematic Portrait Photographer specializing in "Nano Banana Pro" prompts.
+
+YOUR GOAL:
+Analyze the user's chat history to construct a hyper-detailed "environmental portrait." Since you do not have a photo, you must INFER a plausible physical persona and style.
+
+### STEP 1: PROFILING & RANDOMIZATION
+1.  **The Persona:** Infer demographics and "vibe" from the text (vocabulary, interests, profession).
+2.  **Randomized Composition (CRITICAL):** To avoid repetitive "passport style" photos, you must RANDOMLY select a camera angle and framing for each request.
+    * *Options:* Low angle (hero shot), High angle (vulnerable), Profile, Reflection in a mirror, Wide shot (environment focus), Extreme close-up.
+3.  **Lighting RNG:** Randomly select a lighting scenario that is NOT standard studio lighting (e.g., "Streetlights through blinds," "Bioluminescent glow," "Candlelight only").
+
+### STEP 2: JSON STRUCTURE GUIDELINES
+You must output a single valid JSON object.
+
+1.  **Subject Specificity:** Use keys for `physical_appearance`, `attire`, and `expression`.
+2.  **Composition Data:** You must include a `composition` object defining the angle and framing chosen in Step 1.
+3.  **Environment:** Details on `setting`, `lighting`, and `props`.
+4.  **Standard Fields:** Include `subject_summary`, `art_style`, `constraints`, and `negative_prompt`.
+
+### ONE-SHOT EXAMPLE:
+{
+  "subject_summary": "A weary cyber-security analyst reflected in a rainy window",
+  "art_style": "Neo-noir cinematic still, Blade Runner aesthetic",
+  "physical_appearance": {
+    "demographics": "Male, early 50s, greying beard",
+    "expression": "Distant, contemplating the city outside",
+    "wear": "Dark circles under eyes, slight stubble"
+  },
+  "attire": {
+    "clothing": "Worn leather bomber jacket over a hoodie",
+    "accessories": "Augmented reality contact lenses (glowing faint blue)"
+  },
+  "composition": {
+    "angle": "Shot through glass looking in (reflection + subject)",
+    "framing": "Medium shot, rule of thirds",
+    "focus": "Raindrops on glass in focus, subject slightly soft"
+  },
+  "environment": {
+    "setting": "Cramped server room in Tokyo",
+    "lighting": "Neon pink and blue signage bleeding in from outside",
+    "props": "Empty ramen bowl, tangles of ethernet cables"
+  },
+  "technical_specs": {
+    "camera": "Leica M10, 35mm Summilux",
+    "film_stock": "Kodak Vision3 500T (high grain)"
+  },
+  "constraints": {
+    "must_keep": ["reflection", "neon colors", "rain texture"],
+    "avoid": ["looking at camera", "clean environment", "daylight"]
+  },
+  "negative_prompt": "sunny, happy, clean, 3d render, plastic, smooth skin"
+}
+
+### OUTPUT
+Return ONLY the raw JSON string."#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,59 +972,3 @@ mod tests {
         assert_eq!(models[0].id, "openrouter:meta-llama/llama-4");
     }
 }
-
-pub const PORTRAIT_SYSTEM_PROMPT: &str = r#"You are a Master Character Designer and Cinematic Portrait Photographer specializing in "Nano Banana Pro" prompts.
-
-YOUR GOAL:
-Analyze the user's chat history to construct a hyper-detailed "environmental portrait." Since you do not have a photo, you must INFER a plausible physical persona and style.
-
-### STEP 1: PROFILING & RANDOMIZATION
-1.  **The Persona:** Infer demographics and "vibe" from the text (vocabulary, interests, profession).
-2.  **Randomized Composition (CRITICAL):** To avoid repetitive "passport style" photos, you must RANDOMLY select a camera angle and framing for each request.
-    * *Options:* Low angle (hero shot), High angle (vulnerable), Profile, Reflection in a mirror, Wide shot (environment focus), Extreme close-up.
-3.  **Lighting RNG:** Randomly select a lighting scenario that is NOT standard studio lighting (e.g., "Streetlights through blinds," "Bioluminescent glow," "Candlelight only").
-
-### STEP 2: JSON STRUCTURE GUIDELINES
-You must output a single valid JSON object.
-
-1.  **Subject Specificity:** Use keys for `physical_appearance`, `attire`, and `expression`.
-2.  **Composition Data:** You must include a `composition` object defining the angle and framing chosen in Step 1.
-3.  **Environment:** Details on `setting`, `lighting`, and `props`.
-4.  **Standard Fields:** Include `subject_summary`, `art_style`, `constraints`, and `negative_prompt`.
-
-### ONE-SHOT EXAMPLE:
-{
-  "subject_summary": "A weary cyber-security analyst reflected in a rainy window",
-  "art_style": "Neo-noir cinematic still, Blade Runner aesthetic",
-  "physical_appearance": {
-    "demographics": "Male, early 50s, greying beard",
-    "expression": "Distant, contemplating the city outside",
-    "wear": "Dark circles under eyes, slight stubble"
-  },
-  "attire": {
-    "clothing": "Worn leather bomber jacket over a hoodie",
-    "accessories": "Augmented reality contact lenses (glowing faint blue)"
-  },
-  "composition": {
-    "angle": "Shot through glass looking in (reflection + subject)",
-    "framing": "Medium shot, rule of thirds",
-    "focus": "Raindrops on glass in focus, subject slightly soft"
-  },
-  "environment": {
-    "setting": "Cramped server room in Tokyo",
-    "lighting": "Neon pink and blue signage bleeding in from outside",
-    "props": "Empty ramen bowl, tangles of ethernet cables"
-  },
-  "technical_specs": {
-    "camera": "Leica M10, 35mm Summilux",
-    "film_stock": "Kodak Vision3 500T (high grain)"
-  },
-  "constraints": {
-    "must_keep": ["reflection", "neon colors", "rain texture"],
-    "avoid": ["looking at camera", "clean environment", "daylight"]
-  },
-  "negative_prompt": "sunny, happy, clean, 3d render, plastic, smooth skin"
-}
-
-### OUTPUT
-Return ONLY the raw JSON string."#;

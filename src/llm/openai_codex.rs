@@ -413,7 +413,7 @@ fn decode_jwt_payload<T: for<'de> Deserialize<'de>>(jwt: &str) -> Result<T> {
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(payload)
         .context("Failed to decode JWT payload")?;
-    Ok(serde_json::from_slice::<T>(&payload_bytes).context("Failed to parse JWT payload")?)
+    serde_json::from_slice::<T>(&payload_bytes).context("Failed to parse JWT payload")
 }
 
 fn parse_access_token_expiration(jwt: &str) -> Result<Option<DateTime<Utc>>> {
