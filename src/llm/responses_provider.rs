@@ -1,24 +1,26 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use reqwest::StatusCode;
-use serde_json::{Value, json};
-use tracing::{debug, warn};
+use serde_json::{json, Value};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{ThirdPartyModelConfig, ThirdPartyProvider, CONFIG};
 use crate::llm::openai_codex;
 use crate::llm::runtime_models::selected_codex_model_record;
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::web_search::{self, web_search_tool};
-use crate::utils::http::get_http_client;
+use crate::utils::http::{get_http_client, get_http_client_no_compression};
 use crate::utils::timing::log_llm_timing;
 
 const MAX_TOOL_CALL_ITERATIONS: usize = 3;
 const RESPONSES_MAX_ATTEMPTS: usize = 3;
 const RESPONSES_RETRY_BASE_DELAY_MS: u64 = 900;
 const RESPONSES_REQUEST_TIMEOUT_SECS: u64 = 60;
+const RESPONSES_STREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
 const TOOL_LIMIT_SYSTEM_PROMPT: &str = "Tool call limit reached. Provide the best possible answer using the available information without requesting more tool calls.";
 const RESPONSES_TOOL_LIMIT_GUIDANCE: &str = "Tool usage limit: you may use tools for at most {max_tool_calls} rounds total in this conversation. Plan your searches efficiently, avoid redundant tool calls, and after the final allowed tool round you must answer using the information already gathered without requesting more tool calls.";
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -77,6 +79,153 @@ fn summarize_error_body(body: &str) -> (Option<String>, String) {
     (None, truncate_for_log(trimmed, 2000))
 }
 
+fn summarize_responses_payload(payload: &Value) -> String {
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let input_items = payload
+        .get("input")
+        .and_then(|value| value.as_array())
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let input_images = payload
+        .get("input")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("content").and_then(|value| value.as_array()))
+                .flatten()
+                .filter(|item| {
+                    item.get("type").and_then(|value| value.as_str()) == Some("input_image")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let tool_names = payload
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("name")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| tool.get("type").and_then(|value| value.as_str()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let reasoning = payload
+        .pointer("/reasoning/effort")
+        .and_then(|value| value.as_str())
+        .unwrap_or("default");
+    let session_id = payload
+        .get("prompt_cache_key")
+        .and_then(|value| value.as_str())
+        .unwrap_or("none");
+    let stream = payload
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    format!(
+        "model={model}, session_id={session_id}, input_items={input_items}, input_images={input_images}, tools={}, tool_names=[{}], stream={stream}, reasoning={reasoning}",
+        tool_names.len(),
+        tool_names.join(",")
+    )
+}
+
+fn summarize_output_items(output_items: &[Value]) -> String {
+    let mut counts = BTreeMap::new();
+    for item in output_items {
+        let item_type = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        *counts.entry(item_type.to_string()).or_insert(0usize) += 1;
+    }
+
+    counts
+        .into_iter()
+        .map(|(item_type, count)| format!("{item_type}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn debug_model_label(model_config: &ThirdPartyModelConfig) -> &str {
+    if model_config.provider == ThirdPartyProvider::OpenAICodex {
+        model_config.name.as_str()
+    } else {
+        model_config.id.as_str()
+    }
+}
+
+fn summarize_response_headers(headers: &reqwest::header::HeaderMap) -> String {
+    let selected_headers = [
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::CONTENT_ENCODING,
+        reqwest::header::TRANSFER_ENCODING,
+        reqwest::header::CONTENT_LENGTH,
+        reqwest::header::SERVER,
+        reqwest::header::CACHE_CONTROL,
+    ];
+
+    selected_headers
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("{}={}", name.as_str(), truncate_for_log(value, 200)))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn read_response_body_bytes(
+    mut response: reqwest::Response,
+    display_name: &str,
+    model: &str,
+    attempt: usize,
+    streaming_sse: bool,
+) -> Result<(Vec<u8>, String)> {
+    let header_summary = summarize_response_headers(response.headers());
+    let mut body = Vec::new();
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => {
+                return Ok((body, header_summary));
+            }
+            Err(err) => {
+                let body_preview = truncate_for_log(&String::from_utf8_lossy(&body), 2000);
+                error!(
+                    "{} response body decode failed: model={}, attempt={}/{}, streaming_sse={}, timeout={}, connect={}, headers=[{}], partial_bytes={}, partial_body={}, error={}",
+                    display_name,
+                    model,
+                    attempt,
+                    RESPONSES_MAX_ATTEMPTS,
+                    streaming_sse,
+                    err.is_timeout(),
+                    err.is_connect(),
+                    header_summary,
+                    body.len(),
+                    body_preview,
+                    err
+                );
+                return Err(anyhow!(
+                    "{} response body decode failed: {}",
+                    display_name,
+                    err
+                ));
+            }
+        }
+    }
+}
+
 fn responses_should_retry_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect()
 }
@@ -97,8 +246,8 @@ fn build_responses_system_prompt(system_prompt: &str, include_tool_limit_guidanc
         return system_prompt.to_string();
     }
 
-    let tool_limit_guidance =
-        RESPONSES_TOOL_LIMIT_GUIDANCE.replace("{max_tool_calls}", &MAX_TOOL_CALL_ITERATIONS.to_string());
+    let tool_limit_guidance = RESPONSES_TOOL_LIMIT_GUIDANCE
+        .replace("{max_tool_calls}", &MAX_TOOL_CALL_ITERATIONS.to_string());
     format!("{system_prompt}\n\n{tool_limit_guidance}")
 }
 
@@ -156,8 +305,28 @@ fn build_responses_function_tools() -> Vec<Value> {
     })]
 }
 
+fn build_native_codex_web_search_tool(model_config: &ThirdPartyModelConfig) -> Option<Value> {
+    if model_config.provider != ThirdPartyProvider::OpenAICodex {
+        return None;
+    }
+
+    let record = selected_codex_model_record()?;
+    if record.slug != model_config.model {
+        return None;
+    }
+
+    openai_codex::build_native_web_search_tool_from_record(
+        record.supports_search_tool,
+        record.web_search_tool_type,
+        openai_codex::native_web_search_mode(),
+        &CONFIG.openai_codex_web_search_allowed_domains,
+        Some(&CONFIG.openai_codex_web_search_context_size),
+    )
+}
+
 fn convert_openai_function_tools_to_responses(tools: Vec<Value>) -> Vec<Value> {
-    tools.into_iter()
+    tools
+        .into_iter()
         .filter_map(|tool| {
             let function = tool.get("function")?;
             Some(json!({
@@ -215,7 +384,12 @@ async fn build_request_details(
                 true,
             )
         }
-        _ => return Err(anyhow!("Unsupported responses provider {:?}", model_config.provider)),
+        _ => {
+            return Err(anyhow!(
+                "Unsupported responses provider {:?}",
+                model_config.provider
+            ))
+        }
     };
 
     if streaming_sse {
@@ -277,8 +451,12 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
             return Ok(());
         }
 
-        let value: Value = serde_json::from_str(&payload)
-            .with_context(|| format!("Failed to parse SSE event payload: {}", truncate_for_log(&payload, 500)))?;
+        let value: Value = serde_json::from_str(&payload).with_context(|| {
+            format!(
+                "Failed to parse SSE event payload: {}",
+                truncate_for_log(&payload, 500)
+            )
+        })?;
         match value.get("type").and_then(|value| value.as_str()) {
             Some("response.output_item.done") => {
                 if let Some(item) = value.get("item").cloned() {
@@ -300,7 +478,11 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
                 let detail = value
                     .pointer("/response/error/message")
                     .and_then(|value| value.as_str())
-                    .or_else(|| value.pointer("/error/message").and_then(|value| value.as_str()))
+                    .or_else(|| {
+                        value
+                            .pointer("/error/message")
+                            .and_then(|value| value.as_str())
+                    })
                     .unwrap_or("unknown SSE failure");
                 return Err(anyhow!("Codex SSE request failed: {}", detail));
             }
@@ -325,28 +507,73 @@ fn parse_sse_responses_body(body: &str) -> Result<Value> {
 }
 
 async fn call_provider_api(details: &ResponsesRequestDetails) -> Result<Value> {
-    let client = get_http_client();
+    let model = details
+        .payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    info!(
+        "{} responses request starting: {}",
+        details.display_name,
+        summarize_responses_payload(&details.payload)
+    );
+    debug!(
+        "{} responses request payload: {}",
+        details.display_name,
+        truncate_for_log(&details.payload.to_string(), 2000)
+    );
+    let request_timeout_secs = if details.streaming_sse {
+        RESPONSES_STREAM_REQUEST_TIMEOUT_SECS
+    } else {
+        RESPONSES_REQUEST_TIMEOUT_SECS
+    };
+    let client = if details.streaming_sse {
+        get_http_client_no_compression()
+    } else {
+        get_http_client()
+    };
     for attempt in 1..=RESPONSES_MAX_ATTEMPTS {
         let mut request = client
             .post(&details.url)
-            .timeout(Duration::from_secs(RESPONSES_REQUEST_TIMEOUT_SECS));
+            .timeout(Duration::from_secs(request_timeout_secs));
         for (name, value) in &details.headers {
             request = request.header(name, value);
         }
+        if details.streaming_sse {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        }
+        debug!(
+            "{} request timeout configured: model={}, timeout_secs={}, streaming_sse={}, attempt={}/{}",
+            details.display_name,
+            model,
+            request_timeout_secs,
+            details.streaming_sse,
+            attempt,
+            RESPONSES_MAX_ATTEMPTS
+        );
 
         let response = match request.json(&details.payload).send().await {
             Ok(response) => response,
             Err(err) => {
                 let should_retry =
                     responses_should_retry_error(&err) && attempt < RESPONSES_MAX_ATTEMPTS;
-                warn!(
-                    "{} responses request failed to send: {} (attempt={}/{}, retrying={})",
+                let log_message = format!(
+                    "{} responses request failed to send: model={}, error={}, timeout={}, connect={}, status={:?}, attempt={}/{}, retrying={}",
                     details.display_name,
+                    model,
                     err,
+                    err.is_timeout(),
+                    err.is_connect(),
+                    err.status(),
                     attempt,
                     RESPONSES_MAX_ATTEMPTS,
                     should_retry
                 );
+                if should_retry {
+                    warn!("{log_message}");
+                } else {
+                    error!("{log_message}");
+                }
                 if should_retry {
                     tokio::time::sleep(responses_retry_delay(attempt)).await;
                     continue;
@@ -362,21 +589,34 @@ async fn call_provider_api(details: &ResponsesRequestDetails) -> Result<Value> {
                 && details.provider == ThirdPartyProvider::OpenAICodex
                 && attempt < RESPONSES_MAX_ATTEMPTS
             {
+                warn!(
+                    "{} responses request unauthorized for model={}; refreshing Codex auth and retrying (attempt={}/{})",
+                    details.display_name,
+                    model,
+                    attempt,
+                    RESPONSES_MAX_ATTEMPTS
+                );
                 openai_codex::force_refresh_auth_tokens().await?;
                 continue;
             }
             let (message, body_summary) = summarize_error_body(&body);
             let should_retry =
                 responses_should_retry_status(status) && attempt < RESPONSES_MAX_ATTEMPTS;
-            warn!(
-                "{} responses API error: status={}, body={}, attempt={}/{}, retrying={}",
+            let log_message = format!(
+                "{} responses API error: model={}, status={}, body={}, attempt={}/{}, retrying={}",
                 details.display_name,
+                model,
                 status,
                 body_summary,
                 attempt,
                 RESPONSES_MAX_ATTEMPTS,
                 should_retry
             );
+            if should_retry {
+                warn!("{log_message}");
+            } else {
+                error!("{log_message}");
+            }
             if should_retry {
                 tokio::time::sleep(responses_retry_delay(attempt)).await;
                 continue;
@@ -390,20 +630,89 @@ async fn call_provider_api(details: &ResponsesRequestDetails) -> Result<Value> {
             ));
         }
 
-        let value = if details.streaming_sse {
-            let body = response.text().await?;
-            parse_sse_responses_body(&body)?
-        } else {
-            response.json::<Value>().await?
-        };
-        debug!(
-            "{} responses received for model={}",
+        let (body_bytes, header_summary) = read_response_body_bytes(
+            response,
             details.display_name,
-            details
-                .payload
-                .get("model")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown")
+            model,
+            attempt,
+            details.streaming_sse,
+        )
+        .await?;
+        debug!(
+            "{} response headers for model={}: [{}]",
+            details.display_name, model, header_summary
+        );
+        let body = match String::from_utf8(body_bytes) {
+            Ok(body) => body,
+            Err(err) => {
+                let bytes = err.into_bytes();
+                error!(
+                    "{} response body was not valid UTF-8: model={}, attempt={}/{}, headers=[{}], bytes={}, body={}",
+                    details.display_name,
+                    model,
+                    attempt,
+                    RESPONSES_MAX_ATTEMPTS,
+                    header_summary,
+                    bytes.len(),
+                    truncate_for_log(&String::from_utf8_lossy(&bytes), 2000)
+                );
+                return Err(anyhow!(
+                    "{} response body was not valid UTF-8",
+                    details.display_name
+                ));
+            }
+        };
+
+        let value = if details.streaming_sse {
+            match parse_sse_responses_body(&body) {
+                Ok(value) => value,
+                Err(err) => {
+                    error!(
+                        "{} SSE parse failed: model={}, attempt={}/{}, headers=[{}], body={}",
+                        details.display_name,
+                        model,
+                        attempt,
+                        RESPONSES_MAX_ATTEMPTS,
+                        header_summary,
+                        truncate_for_log(&body, 2000)
+                    );
+                    return Err(err);
+                }
+            }
+        } else {
+            match serde_json::from_str::<Value>(&body) {
+                Ok(value) => value,
+                Err(err) => {
+                    error!(
+                        "{} JSON parse failed: model={}, attempt={}/{}, headers=[{}], body={}",
+                        details.display_name,
+                        model,
+                        attempt,
+                        RESPONSES_MAX_ATTEMPTS,
+                        header_summary,
+                        truncate_for_log(&body, 2000)
+                    );
+                    return Err(anyhow!(
+                        "{} response JSON parse failed: {}",
+                        details.display_name,
+                        err
+                    ));
+                }
+            }
+        };
+        let output_items = extract_response_output_items(&value);
+        info!(
+            "{} responses request completed: model={}, output_items={}, output_summary=[{}]",
+            details.display_name,
+            model,
+            output_items.len(),
+            summarize_output_items(&output_items)
+        );
+        debug!(
+            "{} responses received for model={}, raw_response={}",
+            details.display_name,
+            model,
+            truncate_for_log(&value.to_string(), 2000)
         );
         return Ok(value);
     }
@@ -426,7 +735,8 @@ fn extract_response_text(output_items: &[Value]) -> String {
     for item in output_items {
         match item.get("type").and_then(|value| value.as_str()) {
             Some("message") => {
-                if let Some(content_items) = item.get("content").and_then(|value| value.as_array()) {
+                if let Some(content_items) = item.get("content").and_then(|value| value.as_array())
+                {
                     for content_item in content_items {
                         let item_type = content_item.get("type").and_then(|value| value.as_str());
                         if matches!(item_type, Some("output_text") | Some("text")) {
@@ -443,9 +753,12 @@ fn extract_response_text(output_items: &[Value]) -> String {
                 }
             }
             Some("reasoning") => {
-                if let Some(summary_items) = item.get("summary").and_then(|value| value.as_array()) {
+                if let Some(summary_items) = item.get("summary").and_then(|value| value.as_array())
+                {
                     for summary_item in summary_items {
-                        if let Some(text) = summary_item.get("text").and_then(|value| value.as_str()) {
+                        if let Some(text) =
+                            summary_item.get("text").and_then(|value| value.as_str())
+                        {
                             let trimmed = text.trim();
                             if !trimmed.is_empty() {
                                 reasoning_parts.push(trimmed.to_string());
@@ -483,6 +796,11 @@ fn extract_response_tool_calls(output_items: &[Value]) -> Vec<ResponsesToolCall>
 }
 
 async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> {
+    debug!(
+        "Responses tool call requested: name={}, arguments={}",
+        name,
+        truncate_for_log(&arguments.to_string(), 500)
+    );
     match name {
         "web_search" => {
             let query = arguments
@@ -494,7 +812,13 @@ async fn execute_function_tool(name: &str, arguments: &Value) -> Result<String> 
                 .and_then(|value| value.as_u64())
                 .map(|value| value as usize);
             match web_search_tool(query, max_results).await {
-                Ok(result) => Ok(result),
+                Ok(result) => {
+                    debug!(
+                        "Responses tool call web_search completed: chars={}",
+                        result.chars().count()
+                    );
+                    Ok(result)
+                }
                 Err(err) => Err(err),
             }
         }
@@ -509,8 +833,22 @@ async fn responses_completion_with_tools(
 ) -> Result<String> {
     let tools = build_responses_function_tools();
     let session_id = generate_session_id();
+    let model_label = debug_model_label(model_config);
+    debug!(
+        "Responses tool loop starting: model={}, session_id={}, tools_enabled={}",
+        model_label,
+        session_id,
+        !tools.is_empty()
+    );
 
     for iteration in 0..MAX_TOOL_CALL_ITERATIONS {
+        debug!(
+            "Responses tool iteration {}/{} for model={} session_id={}",
+            iteration + 1,
+            MAX_TOOL_CALL_ITERATIONS,
+            model_label,
+            session_id
+        );
         let details = build_request_details(
             model_config,
             instructions,
@@ -528,10 +866,20 @@ async fn responses_completion_with_tools(
             return Ok(content);
         }
 
+        debug!(
+            "Responses tool iteration {}/{} returned {} tool call(s) for model={} session_id={}",
+            iteration + 1,
+            MAX_TOOL_CALL_ITERATIONS,
+            tool_calls.len(),
+            model_label,
+            session_id
+        );
+
         input_items.extend(output_items.clone());
 
         for tool_call in tool_calls {
-            let args_value: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
+            let args_value: Value =
+                serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
             let result = execute_function_tool(&tool_call.name, &args_value)
                 .await
                 .unwrap_or_else(|err| err.to_string());
@@ -553,7 +901,9 @@ async fn responses_completion_with_tools(
             )
             .await?;
             let response = call_provider_api(&details).await?;
-            return Ok(extract_response_text(&extract_response_output_items(&response)));
+            return Ok(extract_response_text(&extract_response_output_items(
+                &response,
+            )));
         }
     }
 
@@ -565,13 +915,38 @@ async fn responses_completion_with_tool_runtime(
     mut input_items: Vec<Value>,
     model_config: &ThirdPartyModelConfig,
     runtime: &mut ToolRuntime,
+    native_codex_web_search_tool: Option<Value>,
 ) -> Result<String> {
-    let tools = convert_openai_function_tools_to_responses(runtime.build_openai_function_tools());
+    let mut tools =
+        convert_openai_function_tools_to_responses(runtime.build_openai_function_tools());
+    let has_native_codex_web_search = native_codex_web_search_tool.is_some();
+    let model_label = debug_model_label(model_config);
+    if has_native_codex_web_search {
+        tools
+            .retain(|tool| tool.get("name").and_then(|value| value.as_str()) != Some("web_search"));
+    }
+    if let Some(native_tool) = native_codex_web_search_tool {
+        tools.push(native_tool);
+    }
     let mut tools_enabled = !tools.is_empty();
     let session_id = generate_session_id();
     let mut final_answer_requested = false;
+    debug!(
+        "Responses runtime tool loop starting: model={}, session_id={}, tools_enabled={}, native_codex_web_search={}",
+        model_label,
+        session_id,
+        tools_enabled,
+        has_native_codex_web_search
+    );
 
-    for _ in 0..runtime.max_total_successful_calls().saturating_add(2) {
+    for iteration in 0..runtime.max_total_successful_calls().saturating_add(2) {
+        debug!(
+            "Responses runtime iteration {} for model={} session_id={} tools_enabled={}",
+            iteration + 1,
+            model_label,
+            session_id,
+            tools_enabled
+        );
         let details = build_request_details(
             model_config,
             instructions,
@@ -592,10 +967,19 @@ async fn responses_completion_with_tool_runtime(
             return Ok(extract_response_text(&output_items));
         }
 
+        debug!(
+            "Responses runtime iteration {} returned {} tool call(s) for model={} session_id={}",
+            iteration + 1,
+            tool_calls.len(),
+            model_label,
+            session_id
+        );
+
         input_items.extend(output_items.clone());
 
         for tool_call in tool_calls {
-            let args_value: Value = serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+            let args_value: Value =
+                serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
             let result = runtime.execute_tool(&tool_call.name, &args_value).await;
             input_items.push(json!({
                 "type": "function_call_output",
@@ -611,11 +995,18 @@ async fn responses_completion_with_tool_runtime(
     }
 
     let final_instructions = format!("{instructions}\n\n{TOOL_LIMIT_SYSTEM_PROMPT}");
-    let details =
-        build_request_details(model_config, &final_instructions, input_items, None, &session_id)
-            .await?;
+    let details = build_request_details(
+        model_config,
+        &final_instructions,
+        input_items,
+        None,
+        &session_id,
+    )
+    .await?;
     let response = call_provider_api(&details).await?;
-    Ok(extract_response_text(&extract_response_output_items(&response)))
+    Ok(extract_response_text(&extract_response_output_items(
+        &response,
+    )))
 }
 
 pub async fn call_responses_provider(
@@ -626,15 +1017,31 @@ pub async fn call_responses_provider(
     image_data_list: &[Vec<u8>],
     supports_tools: bool,
 ) -> Result<String> {
-    let tools_enabled = supports_tools && web_search::is_search_enabled();
-    let instructions = build_responses_system_prompt(system_prompt, tools_enabled);
+    let native_codex_web_search_tool = supports_tools
+        .then(|| build_native_codex_web_search_tool(model_config))
+        .flatten();
+    let custom_tools_enabled =
+        supports_tools && native_codex_web_search_tool.is_none() && web_search::is_search_enabled();
+    let model_label = debug_model_label(model_config);
+    debug!(
+        "Responses provider selected: provider={}, model={}, response_title={}, supports_tools={}, custom_tools_enabled={}, native_codex_web_search={}, image_count={}",
+        model_config.provider.as_str(),
+        model_label,
+        response_title,
+        supports_tools,
+        custom_tools_enabled,
+        native_codex_web_search_tool.is_some(),
+        image_data_list.len()
+    );
+    let instructions = build_responses_system_prompt(system_prompt, custom_tools_enabled);
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
+    let timing_model = debug_model_label(model_config).to_string();
 
-    if tools_enabled {
+    if custom_tools_enabled {
         return log_llm_timing(
             model_config.provider.as_str(),
-            &model_config.id,
+            &timing_model,
             &operation,
             None,
             || async {
@@ -647,16 +1054,24 @@ pub async fn call_responses_provider(
     }
 
     let session_id = generate_session_id();
-    let details =
-        build_request_details(model_config, &instructions, input_items, None, &session_id).await?;
+    let details = build_request_details(
+        model_config,
+        &instructions,
+        input_items,
+        native_codex_web_search_tool.map(|tool| vec![tool]),
+        &session_id,
+    )
+    .await?;
     log_llm_timing(
         model_config.provider.as_str(),
-        &model_config.id,
+        &timing_model,
         &operation,
         None,
         || async {
             let response = call_provider_api(&details).await?;
-            Ok(extract_response_text(&extract_response_output_items(&response)))
+            Ok(extract_response_text(&extract_response_output_items(
+                &response,
+            )))
         },
     )
     .await
@@ -673,16 +1088,33 @@ pub async fn call_responses_provider_with_tool_runtime(
     let instructions = format!("{}\n\n{}", system_prompt, runtime.tool_limit_guidance());
     let input_items = build_responses_user_input(user_content, image_data_list);
     let operation = format!("{}:{}", model_config.provider.as_str(), response_title);
+    let native_codex_web_search_tool = build_native_codex_web_search_tool(model_config);
+    let model_label = debug_model_label(model_config);
+    let timing_model = model_label.to_string();
+    debug!(
+        "Responses provider runtime selected: provider={}, model={}, response_title={}, native_codex_web_search={}, image_count={}",
+        model_config.provider.as_str(),
+        model_label,
+        response_title,
+        native_codex_web_search_tool.is_some(),
+        image_data_list.len()
+    );
 
     log_llm_timing(
         model_config.provider.as_str(),
-        &model_config.id,
+        &timing_model,
         &operation,
         None,
         || async {
-            responses_completion_with_tool_runtime(&instructions, input_items, model_config, runtime)
-                .await
-                .map_err(|err| anyhow!(err))
+            responses_completion_with_tool_runtime(
+                &instructions,
+                input_items,
+                model_config,
+                runtime,
+                native_codex_web_search_tool.clone(),
+            )
+            .await
+            .map_err(|err| anyhow!(err))
         },
     )
     .await

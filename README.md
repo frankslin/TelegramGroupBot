@@ -145,11 +145,15 @@ The container defaults to `DATABASE_URL=sqlite:///data/bot.db`. Mount `./data` t
 - `OPENAI_CODEX_BASE_URL` - Default: `https://chatgpt.com/backend-api/codex`.
 - `OPENAI_CODEX_ORIGINATOR` - Request originator header. Default: `codex_cli_rs`.
 - `OPENAI_CODEX_CLIENT_VERSION` - Codex model-catalog compatibility version sent to `/models`. Default: `0.99.0`.
+- `OPENAI_CODEX_WEB_SEARCH_MODE` - Native Codex web search mode: `live`, `cached`, or `disabled`. Default: `live`.
+- `OPENAI_CODEX_WEB_SEARCH_CONTEXT_SIZE` - Optional native Codex web search context size (for example `low`, `medium`, `high`).
+- `OPENAI_CODEX_WEB_SEARCH_ALLOWED_DOMAINS` - Optional comma-separated domain allowlist for native Codex web search.
 - `OPENAI_CODEX_AUTH_PATH` - Local auth cache path. Default: `data/openai_codex_auth.json`.
 - `OPENAI_CODEX_MODEL_PATH` - Local selected-model cache path. Default: `data/openai_codex_model.json`.
 - Login is managed with `/codexlogin` and `/codexlogout`.
 - The active Codex model is selected live with `/codexmodel` and exposed in the bot as the runtime alias `openai-codex:selected`.
 - The active Codex reasoning effort is selected with `/codexreasoning` and is only offered when the chosen model advertises supported reasoning levels.
+- When the selected Codex model advertises native search support, the bot now uses Codex's built-in `web_search` Responses tool instead of the local external `web_search` function tool.
 
 Legacy OpenRouter model variables (used if JSON is missing):
 - `LLAMA_MODEL`

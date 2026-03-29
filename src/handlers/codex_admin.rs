@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ReplyParameters};
@@ -69,7 +69,10 @@ fn build_model_selection_text(models: &[CodexRemoteModel], page: usize) -> Strin
     )
 }
 
-fn build_model_selection_keyboard(models: &[CodexRemoteModel], page: usize) -> InlineKeyboardMarkup {
+fn build_model_selection_keyboard(
+    models: &[CodexRemoteModel],
+    page: usize,
+) -> InlineKeyboardMarkup {
     let total_pages = models.len().div_ceil(CODEX_MODEL_PAGE_SIZE).max(1);
     let start = page.saturating_mul(CODEX_MODEL_PAGE_SIZE);
     let end = (start + CODEX_MODEL_PAGE_SIZE).min(models.len());
@@ -116,7 +119,8 @@ fn selected_model_record(
     let previous_selection = runtime_models::selected_codex_model_record()
         .and_then(|record| record.selected_reasoning_level)
         .filter(|level| {
-            model.supported_reasoning_levels
+            model
+                .supported_reasoning_levels
                 .iter()
                 .any(|option| option.effort == *level)
         });
@@ -132,12 +136,14 @@ fn selected_model_record(
                 CodexInputModality::Text => "text".to_string(),
                 CodexInputModality::Image => "image".to_string(),
             })
-        .collect(),
+            .collect(),
         priority: model.priority,
         etag,
         default_reasoning_level: model.default_reasoning_level.clone(),
         supported_reasoning_levels: model.supported_reasoning_levels.clone(),
         selected_reasoning_level: previous_selection,
+        web_search_tool_type: model.web_search_tool_type,
+        supports_search_tool: model.supports_search_tool,
         fetched_at: Utc::now(),
     }
 }
@@ -185,8 +191,14 @@ fn build_reasoning_selection_keyboard(
 }
 
 async fn handle_model_selection_timeout(bot: Bot, state: AppState, request_id: String) {
-    tokio::time::sleep(Duration::from_secs(crate::config::CONFIG.model_selection_timeout)).await;
-    let pending = state.pending_codex_model_requests.lock().remove(&request_id);
+    tokio::time::sleep(Duration::from_secs(
+        crate::config::CONFIG.model_selection_timeout,
+    ))
+    .await;
+    let pending = state
+        .pending_codex_model_requests
+        .lock()
+        .remove(&request_id);
     let Some(pending) = pending else {
         return;
     };
@@ -347,10 +359,7 @@ pub async fn codex_model_handler(bot: Bot, state: AppState, message: Message) ->
 
     let page = 0;
     let selection_message = bot
-        .send_message(
-            message.chat.id,
-            build_model_selection_text(&models, page),
-        )
+        .send_message(message.chat.id, build_model_selection_text(&models, page))
         .reply_parameters(ReplyParameters::new(message.id))
         .reply_markup(build_model_selection_keyboard(&models, page))
         .await?;
@@ -458,7 +467,10 @@ pub async fn codex_reasoning_handler(bot: Bot, state: AppState, message: Message
     let bot_clone = bot.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(crate::config::CONFIG.model_selection_timeout)).await;
+        tokio::time::sleep(Duration::from_secs(
+            crate::config::CONFIG.model_selection_timeout,
+        ))
+        .await;
         let pending = state_clone
             .pending_codex_reasoning_requests
             .lock()
@@ -524,7 +536,11 @@ pub async fn codex_admin_callback(bot: Bot, state: AppState, query: CallbackQuer
                         .unwrap_or_default();
                     let level = if raw == "default" {
                         None
-                    } else if pending.supported_levels.iter().any(|entry| entry.effort == raw) {
+                    } else if pending
+                        .supported_levels
+                        .iter()
+                        .any(|entry| entry.effort == raw)
+                    {
                         Some(raw.to_string())
                     } else {
                         return Err(anyhow!("invalid Codex reasoning selection"));

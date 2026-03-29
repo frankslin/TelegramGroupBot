@@ -1,16 +1,17 @@
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::config::CONFIG;
 use crate::utils::http::get_http_client;
@@ -27,7 +28,11 @@ static TOKEN_REFRESH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 pub struct OpenAICodexAuthFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
-    #[serde(rename = "OPENAI_API_KEY", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "OPENAI_API_KEY",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub openai_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<OpenAICodexTokenData>,
@@ -89,6 +94,14 @@ pub struct CodexReasoningEffortOption {
     pub description: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexWebSearchToolType {
+    #[default]
+    Text,
+    TextAndImage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodexRemoteModel {
     pub slug: String,
@@ -102,8 +115,12 @@ pub struct CodexRemoteModel {
     pub visibility: CodexModelVisibility,
     pub supported_in_api: bool,
     pub priority: i32,
+    #[serde(default)]
+    pub web_search_tool_type: CodexWebSearchToolType,
     #[serde(default = "default_input_modalities")]
     pub input_modalities: Vec<CodexInputModality>,
+    #[serde(default)]
+    pub supports_search_tool: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +186,23 @@ struct CodexModelsResponse {
     models: Vec<CodexRemoteModel>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexWebSearchMode {
+    Disabled,
+    Cached,
+    Live,
+}
+
+impl CodexWebSearchMode {
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cached" => Self::Cached,
+            "live" => Self::Live,
+            _ => Self::Disabled,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DeviceCodeUserCodeRequest<'a> {
     client_id: &'a str,
@@ -214,6 +248,27 @@ fn current_user_agent() -> String {
     format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
 
+fn truncate_for_log(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(limit).collect();
+    format!("{truncated}... (truncated)")
+}
+
+fn summarize_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "empty response body".to_string();
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return truncate_for_log(&value.to_string(), 2000);
+    }
+
+    truncate_for_log(trimmed, 2000)
+}
+
 fn load_auth_file_internal() -> Result<Option<OpenAICodexAuthFile>> {
     let path = auth_file_path();
     let raw = match fs::read_to_string(path) {
@@ -228,9 +283,10 @@ fn load_auth_file_internal() -> Result<Option<OpenAICodexAuthFile>> {
         }
     };
 
-    Ok(Some(serde_json::from_str::<OpenAICodexAuthFile>(&raw).with_context(
-        || format!("Failed to parse Codex auth file {}", path.display()),
-    )?))
+    Ok(Some(
+        serde_json::from_str::<OpenAICodexAuthFile>(&raw)
+            .with_context(|| format!("Failed to parse Codex auth file {}", path.display()))?,
+    ))
 }
 
 fn save_auth_file(auth: &OpenAICodexAuthFile) -> Result<()> {
@@ -377,6 +433,11 @@ async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAu
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        error!(
+            "Codex token refresh failed: status={}, body={}",
+            status,
+            summarize_error_body(&body)
+        );
         return Err(anyhow!(
             "Codex token refresh failed with status {}: {}",
             status,
@@ -394,7 +455,9 @@ async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAu
         .as_ref()
         .ok_or_else(|| anyhow!("Missing Codex token state"))?;
 
-    let id_token = refresh.id_token.unwrap_or_else(|| existing.id_token.clone());
+    let id_token = refresh
+        .id_token
+        .unwrap_or_else(|| existing.id_token.clone());
     let access_token = refresh
         .access_token
         .unwrap_or_else(|| existing.access_token.clone());
@@ -407,8 +470,14 @@ async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAu
         id_token,
         access_token,
         refresh_token,
-        account_id: parsed.account_id.clone().or_else(|| existing.account_id.clone()),
-        plan_type: parsed.plan_type.clone().or_else(|| existing.plan_type.clone()),
+        account_id: parsed
+            .account_id
+            .clone()
+            .or_else(|| existing.account_id.clone()),
+        plan_type: parsed
+            .plan_type
+            .clone()
+            .or_else(|| existing.plan_type.clone()),
         user_id: parsed.user_id.clone().or_else(|| existing.user_id.clone()),
         email: parsed.email.clone().or_else(|| existing.email.clone()),
     });
@@ -420,6 +489,7 @@ async fn refresh_auth_tokens(auth: &OpenAICodexAuthFile) -> Result<OpenAICodexAu
 pub async fn force_refresh_auth_tokens() -> Result<OpenAICodexAuthFile> {
     let _guard = TOKEN_REFRESH_LOCK.lock().await;
     let auth = load_auth_file_internal()?.ok_or_else(|| anyhow!("Codex is not logged in"))?;
+    info!("Forcing Codex auth token refresh");
     refresh_auth_tokens(&auth).await
 }
 
@@ -427,6 +497,7 @@ pub async fn get_valid_auth_context() -> Result<OpenAICodexAuthContext> {
     let _guard = TOKEN_REFRESH_LOCK.lock().await;
     let mut auth = load_auth_file_internal()?.ok_or_else(|| anyhow!("Codex is not logged in"))?;
     if auth_requires_refresh(&auth) {
+        info!("Refreshing Codex auth tokens before request");
         auth = refresh_auth_tokens(&auth).await?;
     }
 
@@ -454,10 +525,7 @@ pub fn codex_headers(
             "Authorization".to_string(),
             format!("Bearer {}", auth.access_token),
         ),
-        (
-            "ChatGPT-Account-Id".to_string(),
-            auth.account_id.clone(),
-        ),
+        ("ChatGPT-Account-Id".to_string(), auth.account_id.clone()),
         ("originator".to_string(), current_originator()),
         ("User-Agent".to_string(), current_user_agent()),
     ];
@@ -470,11 +538,57 @@ pub fn codex_headers(
 }
 
 pub fn codex_base_url() -> String {
-    CONFIG.openai_codex_base_url.trim_end_matches('/').to_string()
+    CONFIG
+        .openai_codex_base_url
+        .trim_end_matches('/')
+        .to_string()
 }
 
 pub fn codex_response_url() -> String {
     format!("{}/responses", codex_base_url())
+}
+
+pub fn native_web_search_mode() -> CodexWebSearchMode {
+    CodexWebSearchMode::from_config(&CONFIG.openai_codex_web_search_mode)
+}
+
+pub fn build_native_web_search_tool_from_record(
+    supports_search_tool: bool,
+    web_search_tool_type: CodexWebSearchToolType,
+    mode: CodexWebSearchMode,
+    allowed_domains: &[String],
+    context_size: Option<&str>,
+) -> Option<Value> {
+    if !supports_search_tool || mode == CodexWebSearchMode::Disabled {
+        return None;
+    }
+
+    let external_web_access = match mode {
+        CodexWebSearchMode::Cached => false,
+        CodexWebSearchMode::Live => true,
+        CodexWebSearchMode::Disabled => return None,
+    };
+
+    let mut tool = json!({
+        "type": "web_search",
+        "external_web_access": external_web_access,
+    });
+
+    if !allowed_domains.is_empty() {
+        tool["filters"] = json!({
+            "allowed_domains": allowed_domains,
+        });
+    }
+
+    if let Some(context_size) = context_size.filter(|value| !value.trim().is_empty()) {
+        tool["search_context_size"] = Value::String(context_size.to_string());
+    }
+
+    if web_search_tool_type == CodexWebSearchToolType::TextAndImage {
+        tool["search_content_types"] = json!(["text", "image"]);
+    }
+
+    Some(tool)
 }
 
 pub async fn fetch_models() -> Result<CodexModelList> {
@@ -504,6 +618,9 @@ pub async fn fetch_models() -> Result<CodexModelList> {
             .context("Failed to fetch Codex models")?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            warn!(
+                "Codex models request unauthorized with client_version={version}; refreshing auth and retrying"
+            );
             let _ = force_refresh_auth_tokens().await?;
             continue;
         }
@@ -511,6 +628,12 @@ pub async fn fetch_models() -> Result<CodexModelList> {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            error!(
+                "Codex models request failed: status={}, client_version={}, body={}",
+                status,
+                version,
+                summarize_error_body(&body)
+            );
             return Err(anyhow!(
                 "Codex models request failed with status {}: {}",
                 status,
@@ -523,10 +646,25 @@ pub async fn fetch_models() -> Result<CodexModelList> {
             .get(reqwest::header::ETAG)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
-        let payload = response
-            .json::<CodexModelsResponse>()
+        let body = response
+            .text()
             .await
-            .context("Failed to parse Codex models response")?;
+            .context("Failed to read Codex models response body")?;
+        let payload = match serde_json::from_str::<CodexModelsResponse>(&body) {
+            Ok(payload) => payload,
+            Err(err) => {
+                error!(
+                    "Failed to parse Codex models response: client_version={}, body={}",
+                    version,
+                    summarize_error_body(&body)
+                );
+                return Err(anyhow!("Failed to parse Codex models response: {}", err));
+            }
+        };
+        info!(
+            "Fetched Codex model catalog successfully: count={}, client_version={version}",
+            payload.models.len()
+        );
 
         return Ok(CodexModelList {
             models: payload.models,
@@ -587,7 +725,10 @@ async fn exchange_authorization_code(
     ])?;
     let response = get_http_client()
         .post(format!("{}/oauth/token", OPENAI_CODEX_DEFAULT_ISSUER))
-        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
         .body(body)
         .send()
         .await
@@ -620,7 +761,9 @@ pub async fn complete_device_code_login(
             return Err(anyhow!("Codex device-code login was cancelled"));
         }
         if Instant::now() >= poll_deadline {
-            return Err(anyhow!("Codex device-code login timed out after 15 minutes"));
+            return Err(anyhow!(
+                "Codex device-code login timed out after 15 minutes"
+            ));
         }
 
         let response = get_http_client()
@@ -727,5 +870,24 @@ mod tests {
             .expect("expiration should exist");
 
         assert_eq!(expiration.timestamp(), now);
+    }
+
+    #[test]
+    fn native_web_search_tool_supports_live_image_search() {
+        let tool = build_native_web_search_tool_from_record(
+            true,
+            CodexWebSearchToolType::TextAndImage,
+            CodexWebSearchMode::Live,
+            &["example.com".to_string()],
+            Some("high"),
+        )
+        .expect("native search tool should be built");
+
+        assert_eq!(tool["type"], "web_search");
+        assert_eq!(tool["external_web_access"], true);
+        assert_eq!(tool["search_context_size"], "high");
+        assert_eq!(tool["filters"]["allowed_domains"][0], "example.com");
+        assert_eq!(tool["search_content_types"][0], "text");
+        assert_eq!(tool["search_content_types"][1], "image");
     }
 }

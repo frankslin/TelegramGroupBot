@@ -27,9 +27,7 @@ use crate::handlers::media::{
 use crate::handlers::responses::send_response;
 use crate::llm::media::detect_mime_type;
 use crate::llm::openai_codex;
-use crate::llm::runtime_models::{
-    runtime_model_count, selected_codex_model_record,
-};
+use crate::llm::runtime_models::{runtime_model_count, selected_codex_model_record};
 use crate::llm::web_search::is_search_enabled;
 use crate::llm::{
     call_gemini, generate_image_with_gemini, generate_music_with_lyria, generate_video_with_veo,
@@ -449,8 +447,9 @@ async fn build_status_report(state: &AppState) -> String {
         CONFIG.is_third_party_provider_ready(crate::config::ThirdPartyProvider::OpenAI);
     let codex_auth = openai_codex::auth_summary();
     let codex_selected_model = selected_codex_model_record();
-    let codex_ready =
-        crate::llm::runtime_models::is_runtime_provider_ready(crate::config::ThirdPartyProvider::OpenAICodex);
+    let codex_ready = crate::llm::runtime_models::is_runtime_provider_ready(
+        crate::config::ThirdPartyProvider::OpenAICodex,
+    );
     let active_codex_login = state.active_codex_login.lock().clone();
 
     let whitelist_path = Path::new(&CONFIG.whitelist_file_path);
@@ -478,7 +477,10 @@ async fn build_status_report(state: &AppState) -> String {
     ));
     report.push_str(&format!("nvidia_ready: {}\n", bool_label(nvidia_ready)));
     report.push_str(&format!("openai_ready: {}\n", bool_label(openai_ready)));
-    report.push_str(&format!("openai_codex_ready: {}\n", bool_label(codex_ready)));
+    report.push_str(&format!(
+        "openai_codex_ready: {}\n",
+        bool_label(codex_ready)
+    ));
     report.push_str(&format!(
         "openai_codex_auth_file: {}\n",
         CONFIG.openai_codex_auth_path
@@ -513,10 +515,34 @@ async fn build_status_report(state: &AppState) -> String {
         "openai_codex_client_version: {}\n",
         CONFIG.openai_codex_client_version
     ));
+    report.push_str(&format!(
+        "openai_codex_web_search_mode: {}\n",
+        CONFIG.openai_codex_web_search_mode
+    ));
+    if !CONFIG
+        .openai_codex_web_search_context_size
+        .trim()
+        .is_empty()
+    {
+        report.push_str(&format!(
+            "openai_codex_web_search_context_size: {}\n",
+            CONFIG.openai_codex_web_search_context_size
+        ));
+    }
+    if !CONFIG.openai_codex_web_search_allowed_domains.is_empty() {
+        report.push_str(&format!(
+            "openai_codex_web_search_allowed_domains: {}\n",
+            CONFIG.openai_codex_web_search_allowed_domains.join(", ")
+        ));
+    }
     if let Some(model) = codex_selected_model {
         report.push_str(&format!(
             "openai_codex_selected_model: {} ({})\n",
             model.display_name, model.slug
+        ));
+        report.push_str(&format!(
+            "openai_codex_selected_model_supports_native_search: {}\n",
+            bool_label(model.supports_search_tool)
         ));
         if let Some(level) = model.selected_reasoning_level {
             report.push_str(&format!("openai_codex_reasoning_override: {}\n", level));
@@ -529,7 +555,10 @@ async fn build_status_report(state: &AppState) -> String {
         bool_label(active_codex_login.is_some())
     ));
     if let Some(login) = active_codex_login {
-        report.push_str(&format!("openai_codex_login_user_id: {}\n", login.admin_user_id));
+        report.push_str(&format!(
+            "openai_codex_login_user_id: {}\n",
+            login.admin_user_id
+        ));
         report.push_str(&format!("openai_codex_login_chat_id: {}\n", login.chat_id));
         report.push_str(&format!(
             "openai_codex_login_started_at: {}\n",

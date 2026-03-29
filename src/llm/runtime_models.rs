@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::config::{
     qualify_third_party_model_id, ThirdPartyModelConfig, ThirdPartyProvider, CONFIG,
 };
-use crate::llm::openai_codex::CodexReasoningEffortOption;
+use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexWebSearchToolType};
 
 pub const OPENAI_CODEX_SELECTED_MODEL_ID: &str = "openai-codex:selected";
 
@@ -34,6 +34,10 @@ pub struct CodexSelectedModelRecord {
     pub supported_reasoning_levels: Vec<CodexReasoningEffortOption>,
     #[serde(default)]
     pub selected_reasoning_level: Option<String>,
+    #[serde(default)]
+    pub web_search_tool_type: CodexWebSearchToolType,
+    #[serde(default)]
+    pub supports_search_tool: bool,
     pub fetched_at: DateTime<Utc>,
 }
 
@@ -46,6 +50,28 @@ struct RuntimeModelsState {
 
 static RUNTIME_MODELS: Lazy<RwLock<RuntimeModelsState>> =
     Lazy::new(|| RwLock::new(build_runtime_models_state()));
+
+fn effective_codex_reasoning_level(record: &CodexSelectedModelRecord) -> Option<&str> {
+    record
+        .selected_reasoning_level
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            record
+                .default_reasoning_level
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+pub fn codex_selected_model_label(record: &CodexSelectedModelRecord) -> String {
+    let mut label = record.slug.trim().to_string();
+    if let Some(level) = effective_codex_reasoning_level(record) {
+        label.push(' ');
+        label.push_str(level.trim());
+    }
+    label
+}
 
 fn selected_model_path() -> &'static Path {
     Path::new(&CONFIG.openai_codex_model_path)
@@ -89,7 +115,7 @@ fn dynamic_codex_model_config(record: &CodexSelectedModelRecord) -> ThirdPartyMo
     ThirdPartyModelConfig {
         id: OPENAI_CODEX_SELECTED_MODEL_ID.to_string(),
         provider: ThirdPartyProvider::OpenAICodex,
-        name: record.display_name.clone(),
+        name: codex_selected_model_label(record),
         model: record.slug.clone(),
         image: supports_images,
         video: false,
@@ -163,9 +189,8 @@ pub fn runtime_model_config(model_id: &str) -> Option<ThirdPartyModelConfig> {
 pub fn resolve_runtime_model_identifier(identifier: &str) -> Option<String> {
     let trimmed = identifier.trim();
     if trimmed.eq_ignore_ascii_case("openai-codex") {
-        return runtime_model_config(OPENAI_CODEX_SELECTED_MODEL_ID).map(|_| {
-            qualify_third_party_model_id(ThirdPartyProvider::OpenAICodex, "selected")
-        });
+        return runtime_model_config(OPENAI_CODEX_SELECTED_MODEL_ID)
+            .map(|_| qualify_third_party_model_id(ThirdPartyProvider::OpenAICodex, "selected"));
     }
 
     if let Some((provider, slug)) = crate::config::parse_third_party_model_id(trimmed) {
@@ -185,7 +210,9 @@ pub fn selected_codex_model_record() -> Option<CodexSelectedModelRecord> {
     RUNTIME_MODELS.read().codex_selected_model.clone()
 }
 
-pub fn save_selected_codex_model(record: &CodexSelectedModelRecord) -> Result<ThirdPartyModelConfig> {
+pub fn save_selected_codex_model(
+    record: &CodexSelectedModelRecord,
+) -> Result<ThirdPartyModelConfig> {
     let path = selected_model_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -202,7 +229,9 @@ pub fn save_selected_codex_model(record: &CodexSelectedModelRecord) -> Result<Th
         .ok_or_else(|| anyhow::anyhow!("Selected Codex model did not load after save"))
 }
 
-pub fn save_selected_codex_reasoning_level(level: Option<String>) -> Result<CodexSelectedModelRecord> {
+pub fn save_selected_codex_reasoning_level(
+    level: Option<String>,
+) -> Result<CodexSelectedModelRecord> {
     let mut record = selected_codex_model_record()
         .ok_or_else(|| anyhow::anyhow!("No Codex model is currently selected"))?;
     record.selected_reasoning_level = level;
@@ -259,6 +288,8 @@ mod tests {
                 description: "medium".to_string(),
             }],
             selected_reasoning_level: None,
+            web_search_tool_type: CodexWebSearchToolType::Text,
+            supports_search_tool: false,
             fetched_at: Utc::now(),
         };
 
@@ -270,5 +301,26 @@ mod tests {
         assert!(!config.audio);
         assert!(!config.video);
         assert!(config.tools);
+        assert_eq!(config.name, "gpt-5.4 medium");
+    }
+
+    #[test]
+    fn codex_selected_model_label_prefers_selected_reasoning_level() {
+        let record = CodexSelectedModelRecord {
+            slug: "gpt-5.4".to_string(),
+            display_name: "GPT-5.4".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: Some("high".to_string()),
+            web_search_tool_type: CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            fetched_at: Utc::now(),
+        };
+
+        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 high");
     }
 }

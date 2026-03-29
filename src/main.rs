@@ -466,7 +466,8 @@ async fn handle_command(
             let state = state.clone();
             let message = message.clone();
             tokio::spawn(async move {
-                if let Err(err) = handlers::codex_admin::codex_login_handler(bot, state, message).await
+                if let Err(err) =
+                    handlers::codex_admin::codex_login_handler(bot, state, message).await
                 {
                     error!("codexlogin handler failed: {err}");
                 }
@@ -534,8 +535,7 @@ async fn handle_callback_query(bot: Bot, state: AppState, query: CallbackQuery) 
         let bot = bot.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handlers::codex_admin::codex_admin_callback(bot, state, query).await
-            {
+            if let Err(err) = handlers::codex_admin::codex_admin_callback(bot, state, query).await {
                 error!("codex admin callback failed: {err}");
             }
         });

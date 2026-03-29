@@ -1,13 +1,13 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use teloxide::types::{FileId, MediaGroupId};
 
 use crate::db::database::Database;
-use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexRemoteModel};
 use crate::llm::media::MediaFile;
+use crate::llm::openai_codex::{CodexReasoningEffortOption, CodexRemoteModel};
 use crate::utils::timing::CommandTimer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,8 +105,7 @@ pub struct AppState {
     pub pending_q_requests: Arc<Mutex<HashMap<String, PendingQRequest>>>,
     pub pending_image_requests: Arc<Mutex<HashMap<String, PendingImageRequest>>>,
     pub pending_codex_model_requests: Arc<Mutex<HashMap<String, PendingCodexModelRequest>>>,
-    pub pending_codex_reasoning_requests:
-        Arc<Mutex<HashMap<String, PendingCodexReasoningRequest>>>,
+    pub pending_codex_reasoning_requests: Arc<Mutex<HashMap<String, PendingCodexReasoningRequest>>>,
     pub active_codex_login: Arc<Mutex<Option<ActiveCodexLogin>>>,
     pub media_groups: Arc<Mutex<HashMap<MediaGroupId, Vec<MediaGroupItem>>>>,
 }

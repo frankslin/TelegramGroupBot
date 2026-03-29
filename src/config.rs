@@ -154,6 +154,9 @@ pub struct Config {
     pub openai_codex_base_url: String,
     pub openai_codex_originator: String,
     pub openai_codex_client_version: String,
+    pub openai_codex_web_search_mode: String,
+    pub openai_codex_web_search_context_size: String,
+    pub openai_codex_web_search_allowed_domains: Vec<String>,
     pub openai_codex_auth_path: String,
     pub openai_codex_model_path: String,
     pub enable_jina_mcp: bool,
@@ -622,6 +625,17 @@ impl Config {
             ),
             openai_codex_originator: env_string("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs"),
             openai_codex_client_version: env_string("OPENAI_CODEX_CLIENT_VERSION", "0.99.0"),
+            openai_codex_web_search_mode: env_string("OPENAI_CODEX_WEB_SEARCH_MODE", "live")
+                .to_lowercase(),
+            openai_codex_web_search_context_size: env_string(
+                "OPENAI_CODEX_WEB_SEARCH_CONTEXT_SIZE",
+                "",
+            )
+            .to_lowercase(),
+            openai_codex_web_search_allowed_domains: env_csv_lowercase(
+                "OPENAI_CODEX_WEB_SEARCH_ALLOWED_DOMAINS",
+                "",
+            ),
             openai_codex_auth_path: env_string(
                 "OPENAI_CODEX_AUTH_PATH",
                 "data/openai_codex_auth.json",

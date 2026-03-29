@@ -25,8 +25,8 @@ use crate::handlers::media::{
 use crate::handlers::responses::send_response;
 use crate::llm::media::MediaKind;
 use crate::llm::runtime_models::{
-    is_runtime_provider_ready, resolve_runtime_model_identifier, runtime_model_config,
-    runtime_model_count, runtime_models,
+    codex_selected_model_label, is_runtime_provider_ready, resolve_runtime_model_identifier,
+    runtime_model_config, runtime_model_count, runtime_models, selected_codex_model_record,
 };
 use crate::llm::tool_runtime::ToolRuntime;
 use crate::llm::{
@@ -36,7 +36,7 @@ use crate::llm::{
 use crate::state::{AppState, PendingQRequest, QaCommandMode};
 use crate::utils::telegram::{build_message_link, start_chat_action_heartbeat};
 use crate::utils::timing::{complete_command_timer, start_command_timer};
-use tracing::warn;
+use tracing::{error, info, warn};
 
 pub const MODEL_CALLBACK_PREFIX: &str = "model_select:";
 pub const MODEL_GEMINI: &str = "gemini";
@@ -212,15 +212,50 @@ fn configured_model_display_name(model_name: &str) -> String {
         "Gemini".to_string()
     } else {
         runtime_model_config(model_name)
-            .map(|config| config.name.clone())
+            .map(|config| {
+                if config.provider == ThirdPartyProvider::OpenAICodex {
+                    if let Some(record) = selected_codex_model_record() {
+                        if record.slug == config.model {
+                            return codex_selected_model_label(&record);
+                        }
+                    }
+                }
+                config.name.clone()
+            })
             .unwrap_or_else(|| model_name.to_string())
+    }
+}
+
+fn result_model_display_name(model_name: &str, gemini_model_used: Option<&str>) -> String {
+    if model_name == MODEL_GEMINI {
+        gemini_model_used
+            .unwrap_or(CONFIG.gemini_model.as_str())
+            .to_string()
+    } else if let Some(config) = runtime_model_config(model_name) {
+        if config.provider == ThirdPartyProvider::OpenAICodex {
+            if let Some(record) = selected_codex_model_record() {
+                if record.slug == config.model {
+                    return codex_selected_model_label(&record);
+                }
+            }
+        }
+        config.model.clone()
+    } else {
+        model_name.to_string()
+    }
+}
+
+fn qa_mode_label(mode: QaCommandMode) -> &'static str {
+    match mode {
+        QaCommandMode::Standard => "standard",
+        QaCommandMode::ChatContext => "chat_context",
     }
 }
 
 fn format_llm_error_message(model_name: &str, err: &anyhow::Error) -> String {
     let display_model = configured_model_display_name(model_name);
-    let provider = runtime_model_config(model_name)
-        .map(|config| third_party_provider_label(config.provider));
+    let provider =
+        runtime_model_config(model_name).map(|config| third_party_provider_label(config.provider));
     let err_text = err.to_string();
 
     let friendly = match provider {
@@ -813,6 +848,33 @@ async fn process_request(
             .map(|config| config.tools)
             .unwrap_or(false)
     };
+    let media_summary = summarize_media_files(&request.media_files);
+    let provider_label = if model_name == MODEL_GEMINI {
+        "Gemini".to_string()
+    } else {
+        runtime_model_config(model_name)
+            .map(|config| third_party_provider_label(config.provider).to_string())
+            .unwrap_or_else(|| "Unknown".to_string())
+    };
+    let logged_model_name = configured_model_display_name(model_name);
+
+    info!(
+        "Processing QA request: mode={}, provider={}, model={}, chat_id={}, user_id={}, message_id={}, selection_message_id={}, tools_enabled={}, images={}, videos={}, audios={}, documents={}, youtube_urls={}, query_len={}",
+        qa_mode_label(request.mode),
+        provider_label,
+        logged_model_name,
+        request.chat_id,
+        request.user_id,
+        request.message_id,
+        request.selection_message_id,
+        supports_tools,
+        media_summary.images,
+        media_summary.videos,
+        media_summary.audios,
+        media_summary.documents,
+        request.youtube_urls.len(),
+        query.chars().count()
+    );
 
     let _chat_action =
         start_chat_action_heartbeat(bot.clone(), ChatId(request.chat_id), ChatAction::Typing);
@@ -893,6 +955,24 @@ async fn process_request(
     let (response, gemini_model_used) = match response {
         Ok(response) => response,
         Err(err) => {
+            error!(
+                "QA request failed: mode={}, provider={}, model={}, chat_id={}, user_id={}, message_id={}, selection_message_id={}, tools_enabled={}, images={}, videos={}, audios={}, documents={}, youtube_urls={}, query_len={}, error={:#}",
+                qa_mode_label(request.mode),
+                provider_label,
+                logged_model_name,
+                request.chat_id,
+                request.user_id,
+                request.message_id,
+                request.selection_message_id,
+                supports_tools,
+                media_summary.images,
+                media_summary.videos,
+                media_summary.audios,
+                media_summary.documents,
+                request.youtube_urls.len(),
+                query.chars().count(),
+                err
+            );
             let message = format_llm_error_message(model_name, &err);
             bot.edit_message_text(
                 ChatId(request.chat_id),
@@ -912,16 +992,7 @@ async fn process_request(
 
     let mut response_text = response;
     if !model_name.is_empty() {
-        let display_model = if model_name == MODEL_GEMINI {
-            gemini_model_used
-                .as_deref()
-                .unwrap_or(CONFIG.gemini_model.as_str())
-                .to_string()
-        } else if let Some(config) = runtime_model_config(model_name) {
-            config.model.clone()
-        } else {
-            model_name.to_string()
-        };
+        let display_model = result_model_display_name(model_name, gemini_model_used.as_deref());
         response_text.push_str(&format!("\n\nModel: {}", display_model));
     }
 
@@ -1042,6 +1113,48 @@ mod tests {
             normalize_model_identifier_with_models("openrouter:shared/model", &models, &aliases),
             "openrouter:shared/model"
         );
+    }
+
+    #[test]
+    fn codex_selected_model_label_prefers_selected_reasoning_level() {
+        let record = crate::llm::runtime_models::CodexSelectedModelRecord {
+            slug: "gpt-5.4".to_string(),
+            display_name: "GPT-5.4".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: Some("high".to_string()),
+            web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            fetched_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 high");
+    }
+
+    #[test]
+    fn codex_selected_model_label_falls_back_to_default_reasoning_level() {
+        let mut record = crate::llm::runtime_models::CodexSelectedModelRecord {
+            slug: "gpt-5.4".to_string(),
+            display_name: "GPT-5.4".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: None,
+            web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            fetched_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 medium");
+        record.selected_reasoning_level = Some(String::new());
+        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 medium");
     }
 }
 
@@ -1665,6 +1778,13 @@ pub async fn handle_model_timeout(bot: Bot, state: AppState, request_key: String
             Some("timeout_default_model".to_string()),
         );
     }
+    if let Err(err) = result {
+        error!(
+            "Timed-out QA request failed after default-model fallback: model={}, error={:#}",
+            configured_model_display_name(&default_model),
+            err
+        );
+    }
 }
 
 pub async fn model_selection_callback(
@@ -1769,11 +1889,7 @@ pub async fn model_selection_callback(
         return Ok(());
     }
 
-    let display_name = if selected_model == MODEL_GEMINI {
-        "Gemini".to_string()
-    } else {
-        selected_model.clone()
-    };
+    let display_name = configured_model_display_name(&selected_model);
 
     let processing_text = if summary.videos > 0 {
         format!(
@@ -1810,6 +1926,10 @@ pub async fn model_selection_callback(
     if let Some(mut timer) = command_timer {
         let status = if result.is_ok() { "success" } else { "error" };
         complete_command_timer(&mut timer, status, None);
+    }
+
+    if let Err(err) = result {
+        return Err(err);
     }
 
     Ok(())
