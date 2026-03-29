@@ -1270,4 +1270,79 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, 77);
     }
+
+    /// Helper that lets the caller specify a custom `user_id`.
+    async fn queue_message_with_user(
+        db: &Database,
+        message_id: i64,
+        chat_id: i64,
+        user_id: i64,
+        username: &str,
+        text: &str,
+    ) {
+        let insert = build_message_insert(
+            Some(user_id),
+            Some(username.to_string()),
+            Some(text.to_string()),
+            Some("en".to_string()),
+            Utc::now(),
+            None,
+            Some(chat_id),
+            Some(message_id),
+            None,
+            false,
+            None,
+            text.trim_start().starts_with('/'),
+            false,
+        );
+        db.queue_message_insert(insert)
+            .await
+            .expect("message queue should succeed");
+        wait_for_message_row(db, chat_id, message_id).await;
+    }
+
+    #[tokio::test]
+    async fn display_labels_disambiguate_same_name_users_in_chat() {
+        use crate::handlers::build_display_label_map;
+
+        let db = init_test_db("disambiguate-names").await;
+        let chat = -1001374348669_i64;
+
+        // Two different users with the same display name "John".
+        queue_message_with_user(&db, 1, chat, 1001, "John", "Hello from first John").await;
+        queue_message_with_user(&db, 2, chat, 1002, "John", "Hello from second John").await;
+        // A third user with a unique name.
+        queue_message_with_user(&db, 3, chat, 1003, "Alice", "Hello from Alice").await;
+
+        let messages = db.select_messages(chat, 10).await.expect("select should work");
+        assert_eq!(messages.len(), 3);
+
+        let label_map = build_display_label_map(messages.iter().filter_map(|m| {
+            m.user_id
+                .map(|uid| (uid, m.username.as_deref().unwrap_or("Anonymous")))
+        }));
+
+        // The two Johns should be disambiguated with ordinal suffixes.
+        assert_eq!(label_map[&1001], "John (1)");
+        assert_eq!(label_map[&1002], "John (2)");
+        // Alice is unique — no suffix.
+        assert_eq!(label_map[&1003], "Alice");
+
+        // Simulate TLDR-style formatting.
+        let mut chat_content = String::new();
+        for msg in &messages {
+            let username = msg
+                .user_id
+                .and_then(|uid| label_map.get(&uid).cloned())
+                .unwrap_or_else(|| {
+                    msg.username.clone().unwrap_or_else(|| "Anonymous".to_string())
+                });
+            let text = msg.text.as_deref().unwrap_or_default();
+            chat_content.push_str(&format!("{}: {}\n", username, text));
+        }
+
+        assert!(chat_content.contains("John (1): Hello from first John"));
+        assert!(chat_content.contains("John (2): Hello from second John"));
+        assert!(chat_content.contains("Alice: Hello from Alice"));
+    }
 }

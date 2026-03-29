@@ -1649,10 +1649,19 @@ pub async fn tldr_handler(
         return Ok(());
     }
 
+    let label_map = super::build_display_label_map(messages.iter().filter_map(|m| {
+        m.user_id
+            .map(|uid| (uid, m.username.as_deref().unwrap_or("Anonymous")))
+    }));
     let mut chat_content = String::new();
     for msg in messages {
         let timestamp = msg.date.format("%Y-%m-%d %H:%M:%S");
-        let username = msg.username.unwrap_or_else(|| "Anonymous".to_string());
+        let username = msg
+            .user_id
+            .and_then(|uid| label_map.get(&uid).cloned())
+            .unwrap_or_else(|| {
+                msg.username.clone().unwrap_or_else(|| "Anonymous".to_string())
+            });
         let text = msg.text.unwrap_or_default();
         chat_content.push_str(&format!("{} {}: {}\n", timestamp, username, text));
     }

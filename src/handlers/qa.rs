@@ -714,8 +714,17 @@ fn format_chat_search_results_html(
     if hits.is_empty() {
         lines.push("No clearly relevant messages were found.".to_string());
     } else {
+        let label_map = super::build_display_label_map(hits.iter().filter_map(|h| {
+            h.user_id
+                .map(|uid| (uid, h.username.as_deref().unwrap_or("Anonymous")))
+        }));
         for (index, hit) in hits.iter().enumerate() {
-            let username = escape_html(hit.username.as_deref().unwrap_or("Anonymous"));
+            let raw_label = hit
+                .user_id
+                .and_then(|uid| label_map.get(&uid))
+                .map(String::as_str)
+                .unwrap_or_else(|| hit.username.as_deref().unwrap_or("Anonymous"));
+            let username = escape_html(raw_label);
             let timestamp = escape_html(&hit.date.format("%Y-%m-%d %H:%M:%S UTC").to_string());
             let snippet = escape_html(&truncate_for_display(&hit.snippet, 120));
             let provenance_prefix = if hit.asks_ai {
