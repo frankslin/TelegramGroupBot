@@ -1022,6 +1022,152 @@ async fn process_request(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPartyModelConfig {
+        ThirdPartyModelConfig {
+            id: format!("{}:{}", provider.as_str(), raw_model),
+            provider,
+            name: name.to_string(),
+            model: raw_model.to_string(),
+            image: false,
+            video: false,
+            audio: false,
+            tools: true,
+        }
+    }
+
+    #[test]
+    fn available_third_party_models_can_require_tools() {
+        let mut without_tools = model(
+            ThirdPartyProvider::OpenRouter,
+            "No Tools",
+            "openrouter/no-tools",
+        );
+        without_tools.tools = false;
+        let models = [
+            model(
+                ThirdPartyProvider::OpenRouter,
+                "With Tools",
+                "openrouter/with-tools",
+            ),
+            without_tools,
+        ];
+
+        assert!(third_party_model_matches_request_capabilities(
+            &models[0], false, false, false, false, true,
+        ));
+        assert!(!third_party_model_matches_request_capabilities(
+            &models[1], false, false, false, false, true,
+        ));
+    }
+
+    #[test]
+    fn normalize_model_identifier_prefers_alias_mapping() {
+        let models = vec![
+            model(
+                ThirdPartyProvider::OpenRouter,
+                "Qwen 3",
+                "qwen/qwen3-next-80b-a3b-instruct:free",
+            ),
+            model(
+                ThirdPartyProvider::Nvidia,
+                "Gemma 3n",
+                "google/gemma-3n-e4b-it",
+            ),
+        ];
+        let aliases = [
+            ("llama", ""),
+            ("grok", ""),
+            ("qwen", "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"),
+            ("deepseek", ""),
+            ("gpt", ""),
+        ];
+
+        assert_eq!(
+            normalize_model_identifier_with_models("qwen", &models, &aliases),
+            "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"
+        );
+        assert_eq!(
+            normalize_model_identifier_with_models("google/gemma-3n-e4b-it", &models, &aliases),
+            "nvidia:google/gemma-3n-e4b-it"
+        );
+    }
+
+    #[test]
+    fn normalize_model_identifier_keeps_ambiguous_raw_model_ids_unqualified() {
+        let models = vec![
+            model(ThirdPartyProvider::OpenRouter, "Shared OR", "shared/model"),
+            model(ThirdPartyProvider::Nvidia, "Shared NV", "shared/model"),
+        ];
+        let aliases = [
+            ("llama", ""),
+            ("grok", ""),
+            ("qwen", ""),
+            ("deepseek", ""),
+            ("gpt", ""),
+        ];
+
+        assert_eq!(
+            normalize_model_identifier_with_models("shared/model", &models, &aliases),
+            "shared/model"
+        );
+        assert_eq!(
+            normalize_model_identifier_with_models("nvidia:shared/model", &models, &aliases),
+            "nvidia:shared/model"
+        );
+        assert_eq!(
+            normalize_model_identifier_with_models("openrouter:shared/model", &models, &aliases),
+            "openrouter:shared/model"
+        );
+    }
+
+    #[test]
+    fn codex_selected_model_label_prefers_selected_reasoning_level() {
+        let record = crate::llm::runtime_models::CodexSelectedModelRecord {
+            slug: "gpt-5.4".to_string(),
+            display_name: "GPT-5.4".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: Some("high".to_string()),
+            web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            fetched_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 high");
+    }
+
+    #[test]
+    fn codex_selected_model_label_falls_back_to_default_reasoning_level() {
+        let mut record = crate::llm::runtime_models::CodexSelectedModelRecord {
+            slug: "gpt-5.4".to_string(),
+            display_name: "GPT-5.4".to_string(),
+            description: None,
+            input_modalities: vec!["text".to_string()],
+            priority: 1,
+            etag: None,
+            default_reasoning_level: Some("medium".to_string()),
+            supported_reasoning_levels: vec![],
+            selected_reasoning_level: None,
+            web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
+            supports_search_tool: false,
+            fetched_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 medium");
+        record.selected_reasoning_level = Some(String::new());
+        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 medium");
+    }
+}
+
 #[allow(deprecated)]
 async fn q_handler_internal(
     bot: Bot,
@@ -1793,152 +1939,6 @@ pub async fn model_selection_callback(
     }
 
     result?;
-
     Ok(())
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn model(provider: ThirdPartyProvider, name: &str, raw_model: &str) -> ThirdPartyModelConfig {
-        ThirdPartyModelConfig {
-            id: format!("{}:{}", provider.as_str(), raw_model),
-            provider,
-            name: name.to_string(),
-            model: raw_model.to_string(),
-            image: false,
-            video: false,
-            audio: false,
-            tools: true,
-        }
-    }
-
-    #[test]
-    fn available_third_party_models_can_require_tools() {
-        let mut without_tools = model(
-            ThirdPartyProvider::OpenRouter,
-            "No Tools",
-            "openrouter/no-tools",
-        );
-        without_tools.tools = false;
-        let models = [
-            model(
-                ThirdPartyProvider::OpenRouter,
-                "With Tools",
-                "openrouter/with-tools",
-            ),
-            without_tools,
-        ];
-
-        assert!(third_party_model_matches_request_capabilities(
-            &models[0], false, false, false, false, true,
-        ));
-        assert!(!third_party_model_matches_request_capabilities(
-            &models[1], false, false, false, false, true,
-        ));
-    }
-
-    #[test]
-    fn normalize_model_identifier_prefers_alias_mapping() {
-        let models = vec![
-            model(
-                ThirdPartyProvider::OpenRouter,
-                "Qwen 3",
-                "qwen/qwen3-next-80b-a3b-instruct:free",
-            ),
-            model(
-                ThirdPartyProvider::Nvidia,
-                "Gemma 3n",
-                "google/gemma-3n-e4b-it",
-            ),
-        ];
-        let aliases = [
-            ("llama", ""),
-            ("grok", ""),
-            ("qwen", "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"),
-            ("deepseek", ""),
-            ("gpt", ""),
-        ];
-
-        assert_eq!(
-            normalize_model_identifier_with_models("qwen", &models, &aliases),
-            "openrouter:qwen/qwen3-next-80b-a3b-instruct:free"
-        );
-        assert_eq!(
-            normalize_model_identifier_with_models("google/gemma-3n-e4b-it", &models, &aliases),
-            "nvidia:google/gemma-3n-e4b-it"
-        );
-    }
-
-    #[test]
-    fn normalize_model_identifier_keeps_ambiguous_raw_model_ids_unqualified() {
-        let models = vec![
-            model(ThirdPartyProvider::OpenRouter, "Shared OR", "shared/model"),
-            model(ThirdPartyProvider::Nvidia, "Shared NV", "shared/model"),
-        ];
-        let aliases = [
-            ("llama", ""),
-            ("grok", ""),
-            ("qwen", ""),
-            ("deepseek", ""),
-            ("gpt", ""),
-        ];
-
-        assert_eq!(
-            normalize_model_identifier_with_models("shared/model", &models, &aliases),
-            "shared/model"
-        );
-        assert_eq!(
-            normalize_model_identifier_with_models("nvidia:shared/model", &models, &aliases),
-            "nvidia:shared/model"
-        );
-        assert_eq!(
-            normalize_model_identifier_with_models("openrouter:shared/model", &models, &aliases),
-            "openrouter:shared/model"
-        );
-    }
-
-    #[test]
-    fn codex_selected_model_label_prefers_selected_reasoning_level() {
-        let record = crate::llm::runtime_models::CodexSelectedModelRecord {
-            slug: "gpt-5.4".to_string(),
-            display_name: "GPT-5.4".to_string(),
-            description: None,
-            input_modalities: vec!["text".to_string()],
-            priority: 1,
-            etag: None,
-            default_reasoning_level: Some("medium".to_string()),
-            supported_reasoning_levels: vec![],
-            selected_reasoning_level: Some("high".to_string()),
-            web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
-            supports_search_tool: false,
-            fetched_at: chrono::Utc::now(),
-        };
-
-        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 high");
-    }
-
-    #[test]
-    fn codex_selected_model_label_falls_back_to_default_reasoning_level() {
-        let mut record = crate::llm::runtime_models::CodexSelectedModelRecord {
-            slug: "gpt-5.4".to_string(),
-            display_name: "GPT-5.4".to_string(),
-            description: None,
-            input_modalities: vec!["text".to_string()],
-            priority: 1,
-            etag: None,
-            default_reasoning_level: Some("medium".to_string()),
-            supported_reasoning_levels: vec![],
-            selected_reasoning_level: None,
-            web_search_tool_type: crate::llm::openai_codex::CodexWebSearchToolType::Text,
-            supports_search_tool: false,
-            fetched_at: chrono::Utc::now(),
-        };
-
-        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 medium");
-        record.selected_reasoning_level = Some(String::new());
-        assert_eq!(codex_selected_model_label(&record), "gpt-5.4 medium");
-    }
-}

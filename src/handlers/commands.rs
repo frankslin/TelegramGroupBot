@@ -2294,10 +2294,7 @@ pub async fn mysong_handler(
             processing_message.id,
             "Lyria song generation",
             "Generating your song failed, retrying ({attempt}/{max})...",
-            || async {
-                generate_music_with_lyria(&lyria_prompt)
-                    .await
-            },
+            || async { generate_music_with_lyria(&lyria_prompt).await },
         )
         .await?;
 

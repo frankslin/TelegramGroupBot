@@ -125,6 +125,17 @@ pub async fn check_access_control(bot: &Bot, message: &Message, command: &str) -
     true
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::normalize_command_name;
+
+    #[test]
+    fn normalize_command_name_trims_slash_and_case() {
+        assert_eq!(normalize_command_name("/ProfileMe "), "profileme");
+        assert_eq!(normalize_command_name("mysong"), "mysong");
+    }
+}
 
 pub async fn check_admin_access(bot: &Bot, message: &Message, command: &str) -> bool {
     if !WHITELIST_LOADED.load(Ordering::SeqCst) {
@@ -173,15 +184,4 @@ pub async fn check_admin_access(bot: &Bot, message: &Message, command: &str) -> 
     }
 
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::normalize_command_name;
-
-    #[test]
-    fn normalize_command_name_trims_slash_and_case() {
-        assert_eq!(normalize_command_name("/ProfileMe "), "profileme");
-        assert_eq!(normalize_command_name("mysong"), "mysong");
-    }
 }

@@ -233,7 +233,6 @@ fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<Str
     let media_pattern = Regex::new(r"!\[[^\]]*?\]\((https?://[^\)]+)\)").unwrap();
     let link_pattern = Regex::new(r"\[([^\]]*?)\]\((https?://[^\)]+)\)").unwrap();
     let empty_link_pattern = Regex::new(r"\[\s*\]\((https?://[^\)]+)\)").unwrap();
-    let whitespace_pattern = Regex::new(r"\s+").unwrap();
 
     let mut cleaned: Vec<String> = Vec::new();
     let mut image_urls = Vec::new();
@@ -248,6 +247,7 @@ fn clean_lines_and_media(lines: &[String]) -> (Vec<String>, Vec<String>, Vec<Str
     ];
     let video_extensions = [".mp4", ".m3u8", ".mpd"];
     let punct_prefixes = [".", ",", ";", ":", ")", "]", "}", "!", "?"];
+    let whitespace_pattern = Regex::new(r"\s+").unwrap();
 
     for line in lines {
         let mut working = line.clone();
